@@ -9,7 +9,7 @@ require('dotenv').config();
 const fs = require('node:fs');
 const path = require('node:path');
 const https = require('https');
-const express = require('express'); // 追加
+const express = require('express'); // expressを追加
 const { Client, Collection, GatewayIntentBits, SlashCommandBuilder } = require('discord.js');
 
 // ─── Client 初期化 ───

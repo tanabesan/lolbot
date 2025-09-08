@@ -18,8 +18,9 @@
     "discord.js": "^14.22.1",
     "dotenv": "^16.6.1",
     "express": "^4.21.2",
-    "jimp": "^0.16.1",   
-    "quantize": "^1.0.0",
-    "minimist": "^1.2.8"
+    "jimp": "^0.16.1",
+    "minimist": "^1.2.8",
+    "mongoose": "^8.18.0",
+    "quantize": "^1.0.0"
   }
 }

@@ -1,10 +1,13 @@
 const { SlashCommandBuilder, PermissionFlagsBits } = require('discord.js');
-const Database = require('better-sqlite3');
+const mongoose = require('mongoose');
+
+// MongoDBモデルにアクセスするために、Mongooseを直接使用
+const Subscription = mongoose.model('Subscription');
 
 module.exports = {
   data: new SlashCommandBuilder()
     .setName('unsubscribe')
-    .setDescription('登録済みの通知（チャンネル+ロール）を解除します。ロール指定なしならそのチャンネルに紐づく全登録を削除します。')
+    .setDescription('新コミュ通知の登録を解除します。')
     .addChannelOption(option =>
       option.setName('channel')
         .setDescription('解除するチャンネル')
@@ -19,49 +22,40 @@ module.exports = {
   async execute(interaction) {
     await interaction.deferReply({ ephemeral: true });
 
-    // 管理権限チェック（Runtime）
     if (!interaction.member || !interaction.member.permissions || !interaction.member.permissions.has(PermissionFlagsBits.ManageGuild)) {
-      return interaction.editReply({ content: 'このコマンドを実行するには「サーバーの管理」権限が必要です。' });
+      return interaction.editReply({ content: 'コマンドを実行できるのは管理権限を持っているユーザーのみです。' });
+    }
+
+    if (!interaction.guild) {
+      return interaction.editReply({ content: 'ボットの参加しているサーバー内で実行してください。' });
     }
 
     const channel = interaction.options.getChannel('channel', true);
     const role = interaction.options.getRole('role', false);
 
-    if (!interaction.guild) {
-      return interaction.editReply({ content: 'サーバー内で実行してください。' });
-    }
-
-    const db = new Database('settings.db');
     try {
-      db.exec(`
-        CREATE TABLE IF NOT EXISTS subscriptions (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          guild_id TEXT,
-          channel_id TEXT,
-          role_id TEXT
-        )
-      `);
-
-      let info;
+      let result;
       if (role) {
-        const del = db.prepare('DELETE FROM subscriptions WHERE guild_id = ? AND channel_id = ? AND role_id = ?');
-        info = del.run(interaction.guild.id, channel.id, role.id);
+        result = await Subscription.deleteOne({
+          guildId: interaction.guild.id,
+          channelId: channel.id,
+          roleId: role.id
+        });
       } else {
-        // ロール指定がなければそのチャンネルに紐づく全てを削除
-        const del = db.prepare('DELETE FROM subscriptions WHERE guild_id = ? AND channel_id = ?');
-        info = del.run(interaction.guild.id, channel.id);
+        result = await Subscription.deleteMany({
+          guildId: interaction.guild.id,
+          channelId: channel.id
+        });
       }
 
-      if (info.changes && info.changes > 0) {
-        await interaction.editReply({ content: `削除しました（${info.changes}件）。` });
+      if (result.deletedCount > 0) {
+        await interaction.editReply({ content: `✅ ${result.deletedCount}件の通知登録を解除しました。` });
       } else {
-        await interaction.editReply({ content: '該当する登録が見つかりませんでした。' });
+        await interaction.editReply({ content: 'このチャンネルには新コミュ通知の登録はありませんでした。' });
       }
-    } catch (err) {
-      console.error('unsubscribe コマンドで DB エラー:', err);
-      await interaction.editReply({ content: '解除中にエラーが発生しました。' });
-    } finally {
-      try { db.close(); } catch(e){/* ignore */ }
+    } catch (e) {
+      console.error('MongoDB 操作エラー:', e);
+      await interaction.editReply({ content: '解除中にエラーが発生しました。', ephemeral: true });
     }
-  }
+  },
 };

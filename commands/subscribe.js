@@ -1,5 +1,8 @@
 const { SlashCommandBuilder, PermissionFlagsBits } = require('discord.js');
-const Database = require('better-sqlite3');
+const mongoose = require('mongoose');
+
+// MongoDBモデルにアクセスするために、Mongooseを直接使用
+const Subscription = mongoose.model('Subscription');
 
 module.exports = {
   data: new SlashCommandBuilder()
@@ -19,41 +22,27 @@ module.exports = {
   async execute(interaction) {
     await interaction.deferReply({ ephemeral: true });
 
-    // 管理権限チェック（Runtime）
     if (!interaction.member || !interaction.member.permissions || !interaction.member.permissions.has(PermissionFlagsBits.ManageGuild)) {
-      return interaction.editReply({ content: 'このコマンドを実行するには「サーバーの管理」権限が必要です。' });
+      return interaction.editReply({ content: 'コマンドを実行できるのは管理権限を持っているユーザーのみです。' });
     }
 
     const channel = interaction.options.getChannel('channel', true);
     const role = interaction.options.getRole('role', false);
 
-    // サーバーコンテキスト必須
     if (!interaction.guild) {
-      return interaction.editReply({ content: 'サーバー内で実行してください。' });
+      return interaction.editReply({ content: 'ボットの参加しているサーバー内で実行してください。' });
     }
 
-    // DB 操作
-    const db = new Database('settings.db');
     try {
-      // テーブルが無い場合でも安全のため作る
-      db.exec(`
-        CREATE TABLE IF NOT EXISTS subscriptions (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          guild_id TEXT,
-          channel_id TEXT,
-          role_id TEXT
-        )
-      `);
-
-      const insert = db.prepare('INSERT INTO subscriptions (guild_id, channel_id, role_id) VALUES (?, ?, ?)');
-      insert.run(interaction.guild.id, channel.id, role ? role.id : null);
-
-      await interaction.editReply({ content: `登録しました: チャンネル ${channel} ${role ? `ロール ${role}` : ''}` });
-    } catch (err) {
-      console.error('subscribe コマンドで DB エラー:', err);
-      await interaction.editReply({ content: '登録中にエラーが発生しました。' });
-    } finally {
-      try { db.close(); } catch(e){/* ignore */ }
+      const doc = await Subscription.findOneAndUpdate(
+        { guildId: interaction.guild.id },
+        { channelId: channel.id, roleId: role ? role.id : null },
+        { upsert: true, new: true }
+      );
+      await interaction.editReply({ content: `✅ 通知を登録しました: チャンネル ${channel} ${role ? `ロール ${role}` : ''}` });
+    } catch (e) {
+      console.error('MongoDB 操作エラー:', e);
+      await interaction.editReply({ content: '登録中にエラーが発生しました。', ephemeral: true });
     }
-  }
+  },
 };

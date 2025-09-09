@@ -1,8 +1,8 @@
 // commands/leaderboard.js
-const { SlashCommandBuilder, EmbedBuilder } = require('discord.js'); // EmbedBuilder をインポート
+const { SlashCommandBuilder, EmbedBuilder } = require('discord.js'); // EmbedBuilder をインポート / Import EmbedBuilder
 const https = require('https');
 
-// 各オプションの選択肢を定義
+// 各オプションの選択肢を定義 / Define choices for each option
 const regionChoices = [
   { name: 'Asia East', value: 'TOK' },
   { name: 'Australia', value: 'AU' },
@@ -14,36 +14,36 @@ const regionChoices = [
 ];
 
 const timeframeChoices = [
-  { name: 'デイリー', value: '0' },
-  { name: 'ウィークリー', value: '1' },
-  { name: 'マンスリー', value: '2' }
+  { name: 'Daily (デイリー)', value: '0' },
+  { name: 'Weekly (ウィークリー)', value: '1' },
+  { name: 'Monthly (マンスリー)', value: '2' }
 ];
 
 const whenChoices = [
-  { name: '現在', value: '1' },
-  { name: '過去', value: '0' }
+  { name: 'Current (現在)', value: '1' },
+  { name: 'Previous (過去)', value: '0' }
 ];
 
 
 module.exports = {
   data: new SlashCommandBuilder()
     .setName('leaderboard')
-    .setDescription('LOLBeans のリーダーボードを表示します')
+    .setDescription('リーダーボードを表示。 / Display the leaderboard.')
     .addStringOption(opt =>
       opt.setName('region')
-        .setDescription('地域を選択してください')
+        .setDescription('地域を選択してください Please select your region')
         .setRequired(true)
         .addChoices(...regionChoices)
     )
     .addStringOption(opt =>
       opt.setName('timeframe')
-        .setDescription('集計期間を選択してください')
+        .setDescription('集計期間を選択してください Please select an aggregation period')
         .setRequired(true)
         .addChoices(...timeframeChoices)
     )
     .addStringOption(opt =>
       opt.setName('when')
-        .setDescription('いつのランキングを表示しますか')
+        .setDescription('表示するランキングの時間 Time of ranking to be displayed')
         .setRequired(true)
         .addChoices(...whenChoices)
     ),
@@ -51,7 +51,7 @@ module.exports = {
     try {
       await interaction.deferReply();
 
-      // ロビー取得
+      // ロビー取得 / Get lobby session ID
       const sessionId = await new Promise((res, rej) => {
         https.get('https://s.lolbeans.io/', r => {
           let d = '';
@@ -64,12 +64,12 @@ module.exports = {
         }).on('error', rej);
       });
 
-      // オプション取得
+      // オプション取得 / Get options
       const region = interaction.options.getString('region');
       const pParam = interaction.options.getString('timeframe');
       const cParam = interaction.options.getString('when');
 
-      // リーダーボード取得
+      // リーダーボード取得 / Get leaderboard
       const values = await new Promise((res, rej) => {
         const url = `https://s.lolbeans.io/leaderboards?s=${sessionId}&r=${region}&m=0&p=${pParam}&c=${cParam}`;
         https.get(url, r => {
@@ -82,33 +82,31 @@ module.exports = {
         }).on('error', rej);
       });
 
-      // ユーザーが選択したオプションの表示名を取得
       const regionText = regionChoices.find(c => c.value === region).name;
       const timeframeText = timeframeChoices.find(c => c.value === pParam).name;
       const whenText = whenChoices.find(c => c.value === cParam).name;
 
-      // エントリーがない場合は、埋め込みでエラーメッセージを送信
+      // エントリーがない場合は、埋め込みでエラーメッセージを送信 / If there are no entries, send an embed with an error message
       if (!values || !values.length) {
         const noEntryEmbed = new EmbedBuilder()
-          .setColor(0xFF0000) // 赤色
-          .setTitle('📭 エントリーが見つかりません')
-          .setDescription(`**${regionText}** の **${whenText}** の **${timeframeText}** ランキングにエントリーがありませんでした。`);
+          .setColor(0xFF0000) // 赤色 / Red color
+          .setTitle('📭 エントリーが見つかりません！\nEntry not found!')
+          .setDescription(`**${regionText}** の **${whenText}** の **${timeframeText}** ランキングにエントリーがありませんでした。\n**${regionText}** of **${whenText}** **${timeframeText}** ranking had no entries.`);
         return interaction.editReply({ embeds: [noEntryEmbed] });
       }
 
-      // ランキングリストの文字列を生成
+      // ランキングリストの文字列を生成 / Generate the ranking list string
       const leaderboardDescription = values
         .map(([username, , wins], i) => {
-          // ユーザー名が空、またはnullの場合は '(名無し)' を使用
-          const displayName = username || '(名無し)';
+          const displayName = username || 'player';
           return `\`${i + 1}.\` **${displayName}** — ${wins} wins`;
         })
-        .join('\n'); // 配列を改行で連結して一つの文字列にする
+        .join('\n');
 
-      // リーダーボードの埋め込みを作成
+      // リーダーボードの埋め込みを作成 / Create the leaderboard embed
       const leaderboardEmbed = new EmbedBuilder()
-        .setColor(0xFFFF00) // 黄色
-        .setTitle(`🏆 LOLBeans Leaderboard 🏆`)
+        .setColor(0xFFFF00) // 黄色 / Yellow color
+        .setTitle(`🏆 Leaderboard 🏆`)
         .setDescription(leaderboardDescription)
         .addFields(
           { name: 'Region', value: regionText, inline: true },
@@ -116,19 +114,18 @@ module.exports = {
           { name: 'Period', value: whenText, inline: true }
         )
         .setTimestamp()
-        .setFooter({ text: 'Powered by LOLBeans API' });
+        .setFooter({ text: 'Powered by LOLBeans' });
 
-      // 埋め込みを送信
+      // 埋め込みを送信 / Send the embed
       await interaction.editReply({ embeds: [leaderboardEmbed] });
 
     } catch (error) {
       console.error('Error executing leaderboard command:', error);
-      // エラーが発生した場合もユーザーにフィードバック
+      // エラーが発生した場合もユーザーにフィードバック / Provide feedback to the user even if an error occurs
       const errorEmbed = new EmbedBuilder()
         .setColor(0xFF0000)
-        .setTitle('❌ エラーが発生しました')
-        .setDescription('リーダーボードの取得中に問題が発生しました。時間をおいて再度お試しください。');
-      // deferReply の後なので、editReply を使用
+        .setTitle('❌ エラーが発生しました An error has occurred.')
+        .setDescription('リーダーボードの取得中に問題が発生しました。時間をおいて再度お試しください。\nA problem occurred while retrieving the leaderboard. Please try again after some time.');
       if (interaction.deferred || interaction.replied) {
         await interaction.editReply({ embeds: [errorEmbed], content: '' });
       } else {

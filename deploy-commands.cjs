@@ -1,74 +1,58 @@
-// deploy-commands.cjs
-
 require('dotenv').config();
 const { REST, Routes } = require('discord.js');
 const fs = require('node:fs');
 const path = require('node:path');
+const mongoose = require('mongoose');
 
-const TOKEN = process.env.DISCORD_TOKEN;
-const CLIENT_ID = process.env.CLIENT_ID;
-const GUILD_ID = process.env.GUILD_ID || null;
+// MongoDB スキーマとモデルを定義
+const SubscriptionSchema = new mongoose.Schema({
+    guildId: { type: String, required: true },
+    channelId: { type: String, required: true },
+    roleId: { type: String, default: null }
+});
+const Subscription = mongoose.model('Subscription', SubscriptionSchema);
 
-if (!TOKEN) {
-  console.error('環境変数 DISCORD_TOKEN が設定されていません。 .env を確認してください。');
-  process.exit(1);
-}
-if (!CLIENT_ID) {
-  console.error('環境変数 CLIENT_ID が設定されていません。 .env を確認してください。');
-  process.exit(1);
-}
+// MongoDBに接続
+(async () => {
+    if (!process.env.MONGO_URI) {
+        console.error('❌ 環境変数 MONGO_URI が設定されていません。');
+        process.exit(1);
+    }
+    try {
+        await mongoose.connect(process.env.MONGO_URI);
+        console.log('✅ MongoDBに接続しました');
+    } catch (err) {
+        console.error('❌ MongoDBへの接続エラー:', err);
+        process.exit(1);
+    }
+})();
+
 
 const commands = [];
+// commands ディレクトリ内のすべてのコマンドファイルを読み込みます
 const commandsPath = path.join(__dirname, 'commands');
-
-if (!fs.existsSync(commandsPath)) {
-  console.error(`commands フォルダが見つかりません: ${commandsPath}`);
-  process.exit(1);
-}
-
 const commandFiles = fs.readdirSync(commandsPath).filter(file => file.endsWith('.js'));
 
 for (const file of commandFiles) {
-  const filePath = path.join(commandsPath, file);
-  try {
-    const command = require(filePath);
-    if (command && command.data && typeof command.data.toJSON === 'function') {
-      commands.push(command.data.toJSON());
-    } else {
-      console.warn(`[警告] ${filePath} に有効な SlashCommandBuilder (data) が見つかりません。`);
-    }
-  } catch (err) {
-    console.error(`[エラー] ${filePath} の読み込みに失敗しました:`, err && err.message ? err.message : err);
-  }
+	const command = require(`./commands/${file}`);
+	commands.push(command.data.toJSON());
 }
 
-if (commands.length === 0) {
-  console.log('登録するコマンドが見つかりませんでした。commands フォルダ内を確認してください。');
-  process.exit(0);
-}
+// RESTモジュールのインスタンスを準備します
+const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
 
-const rest = new REST({ version: '10' }).setToken(TOKEN);
-
+// コマンドをデプロイします
 (async () => {
-  try {
-    if (GUILD_ID) {
-      console.log(`ギルド ${GUILD_ID} に対して ${commands.length} 個のコマンドを登録します（即時反映）。`);
-      const data = await rest.put(
-        Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID),
-        { body: commands }
-      );
-      console.log(`✅ ギルドコマンド登録完了: ${Array.isArray(data) ? data.length : 0} 個`);
-    } else {
-      console.log(`グローバルに ${commands.length} 個のコマンドを登録します（反映に時間がかかる場合があります）。`);
-      const data = await rest.put(
-        Routes.applicationCommands(CLIENT_ID),
-        { body: commands }
-      );
-      console.log(`✅ グローバルコマンド登録完了: ${Array.isArray(data) ? data.length : 0} 個`);
-    }
-    process.exit(0);
-  } catch (error) {
-    console.error('コマンド登録中にエラーが発生しました:', error);
-    process.exit(1);
-  }
+	try {
+		console.log(`グローバルに ${commands.length} 個のコマンドを登録します（反映に時間がかかる場合があります）。`);
+
+		const data = await rest.put(
+			Routes.applicationCommands(process.env.CLIENT_ID),
+			{ body: commands },
+		);
+
+		console.log(`✅ グローバルコマンド登録完了: ${data.length} 個`);
+	} catch (error) {
+		console.error(error);
+	}
 })();

@@ -96,6 +96,10 @@ const migrateFromOldSources = async () => {
 // ─── イベントハンドラ ───
 client.once('clientReady', async () => {
   console.log(`✅ Ready! Logged in as ${client.user.tag}`);
+
+  const serverCount = client.guilds.cache.size;
+  client.user.setActivity(`${serverCount}個のサーバーで稼働中`, { type: 0 });
+
   await migrateFromOldSources();
 });
 
@@ -109,13 +113,10 @@ client.on('interactionCreate', async interaction => {
   } catch (error) {
     console.error(`コマンド "${interaction.commandName}" の実行中にエラーが発生しました:`, error);
     
-    // インタラクションがまだ応答されていない場合のみ、エラーメッセージを返す
     try {
       if (interaction.replied || interaction.deferred) {
-        // すでに応答済み/保留中の場合は、followUpを使用
         await interaction.followUp({ content: 'コマンド実行中にエラーが発生しました。', ephemeral: true });
       } else {
-        // まだ応答していない場合は、replyを使用
         await interaction.reply({ content: 'コマンド実行中にエラーが発生しました。', ephemeral: true });
       }
     } catch (replyError) {
@@ -132,7 +133,6 @@ const PORT = process.env.PORT || 3000;
 const server = app.listen(PORT, () => {
   console.log(`Health server listening on port ${PORT}`);
 });
-
 const shutdown = async () => {
   console.log('シャットダウン開始...');
   try {
@@ -153,7 +153,6 @@ const shutdown = async () => {
     process.exit(0);
   }
 };
-
 process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
 

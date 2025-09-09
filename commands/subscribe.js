@@ -19,18 +19,14 @@ module.exports = {
     )
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
   async execute(interaction) {
-    // 権限チェックはdeferReplyの前に行う
     if (!interaction.member || !interaction.member.permissions.has(PermissionFlagsBits.ManageGuild)) {
-      // 権限がない場合は即座にreply
-      return interaction.reply({ content: 'このコマンドを実行するには「サーバーの管理」権限が必要です。', flags: 64 });
+      return interaction.reply({ content: 'コマンドを実行できるのは管理者のみです。', flags: 64 });
     }
 
     if (!interaction.guild) {
-      // サーバー外の場合は即座にreply
-      return interaction.reply({ content: 'サーバー内で実行してください。', flags: 64 });
+      return interaction.reply({ content: 'ボットの参加しているサーバー内で実行してください。', flags: 64 });
     }
 
-    // すべての前提条件を満たした場合のみ deferReply を実行
     await interaction.deferReply({ flags: 64 });
 
     const channel = interaction.options.getChannel('channel', true);
@@ -52,7 +48,6 @@ module.exports = {
       await interaction.editReply({ content: `✅ 登録しました: チャンネル ${channel} ${role ? `ロール ${role}` : ''}` });
     } catch (err) {
       console.error('MongoDBへのデータ登録中にエラー:', err);
-      // エラーが起きた場合は、必ず editReply を使用してユーザーに知らせる
       await interaction.editReply({ content: 'データベースエラーが発生しました。' });
     }
   }

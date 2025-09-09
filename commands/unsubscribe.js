@@ -21,14 +21,14 @@ module.exports = {
     await interaction.deferReply({ flags: 64 });
 
     if (!interaction.member || !interaction.member.permissions.has(PermissionFlagsBits.ManageGuild)) {
-      return interaction.editReply({ content: 'このコマンドを実行するには「サーバーの管理」権限が必要です。' });
+      return interaction.editReply({ content: 'コマンドを実行できるのは管理者のみです。' });
     }
 
     const channel = interaction.options.getChannel('channel', true);
     const role = interaction.options.getRole('role', false);
 
     if (!interaction.guild) {
-      return interaction.editReply({ content: 'サーバー内で実行してください。' });
+      return interaction.editReply({ content: 'ボットの参加しているサーバー内で実行してください。' });
     }
 
     try {

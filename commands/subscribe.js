@@ -1,7 +1,6 @@
-const { SlashCommandBuilder, PermissionFlagsBits } = require('discord.js');
+// 修正後の subscribe.js
+const { SlashCommandBuilder, PermissionFlagsBits, EmbedBuilder } = require('discord.js');
 const mongoose = require('mongoose');
-
-// MongoDBモデルにアクセスするために、Mongooseを直接使用
 const Subscription = mongoose.model('Subscription');
 
 module.exports = {
@@ -20,29 +19,41 @@ module.exports = {
     )
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
   async execute(interaction) {
-    await interaction.deferReply({ ephemeral: true });
-
-    if (!interaction.member || !interaction.member.permissions || !interaction.member.permissions.has(PermissionFlagsBits.ManageGuild)) {
-      return interaction.editReply({ content: 'コマンドを実行できるのは管理権限を持っているユーザーのみです。' });
+    // 権限チェックはdeferReplyの前に行う
+    if (!interaction.member || !interaction.member.permissions.has(PermissionFlagsBits.ManageGuild)) {
+      // 権限がない場合は即座にreply
+      return interaction.reply({ content: 'このコマンドを実行するには「サーバーの管理」権限が必要です。', flags: 64 });
     }
+
+    if (!interaction.guild) {
+      // サーバー外の場合は即座にreply
+      return interaction.reply({ content: 'サーバー内で実行してください。', flags: 64 });
+    }
+
+    // すべての前提条件を満たした場合のみ deferReply を実行
+    await interaction.deferReply({ flags: 64 });
 
     const channel = interaction.options.getChannel('channel', true);
     const role = interaction.options.getRole('role', false);
 
-    if (!interaction.guild) {
-      return interaction.editReply({ content: 'ボットの参加しているサーバー内で実行してください。' });
-    }
-
     try {
-      const doc = await Subscription.findOneAndUpdate(
-        { guildId: interaction.guild.id },
-        { channelId: channel.id, roleId: role ? role.id : null },
-        { upsert: true, new: true }
+      const doc = {
+        guildId: interaction.guild.id,
+        channelId: channel.id,
+        roleId: role ? role.id : null
+      };
+
+      await Subscription.updateOne(
+        { guildId: doc.guildId },
+        { $set: doc },
+        { upsert: true }
       );
-      await interaction.editReply({ content: `✅ 通知を登録しました: チャンネル ${channel} ${role ? `ロール ${role}` : ''}` });
-    } catch (e) {
-      console.error('MongoDB 操作エラー:', e);
-      await interaction.editReply({ content: '登録中にエラーが発生しました。', ephemeral: true });
+
+      await interaction.editReply({ content: `✅ 登録しました: チャンネル ${channel} ${role ? `ロール ${role}` : ''}` });
+    } catch (err) {
+      console.error('MongoDBへのデータ登録中にエラー:', err);
+      // エラーが起きた場合は、必ず editReply を使用してユーザーに知らせる
+      await interaction.editReply({ content: 'データベースエラーが発生しました。' });
     }
-  },
+  }
 };

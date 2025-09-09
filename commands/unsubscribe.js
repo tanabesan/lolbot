@@ -1,13 +1,11 @@
-const { SlashCommandBuilder, PermissionFlagsBits } = require('discord.js');
+const { SlashCommandBuilder, PermissionFlagsBits, EmbedBuilder } = require('discord.js');
 const mongoose = require('mongoose');
-
-// MongoDBモデルにアクセスするために、Mongooseを直接使用
 const Subscription = mongoose.model('Subscription');
 
 module.exports = {
   data: new SlashCommandBuilder()
     .setName('unsubscribe')
-    .setDescription('新コミュ通知の登録を解除します。')
+    .setDescription('登録済みの通知（チャンネル+ロール）を解除します。ロール指定なしならそのチャンネルに紐づく全登録を削除します。')
     .addChannelOption(option =>
       option.setName('channel')
         .setDescription('解除するチャンネル')
@@ -20,18 +18,18 @@ module.exports = {
     )
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
   async execute(interaction) {
-    await interaction.deferReply({ ephemeral: true });
+    await interaction.deferReply({ flags: 64 });
 
-    if (!interaction.member || !interaction.member.permissions || !interaction.member.permissions.has(PermissionFlagsBits.ManageGuild)) {
-      return interaction.editReply({ content: 'コマンドを実行できるのは管理権限を持っているユーザーのみです。' });
-    }
-
-    if (!interaction.guild) {
-      return interaction.editReply({ content: 'ボットの参加しているサーバー内で実行してください。' });
+    if (!interaction.member || !interaction.member.permissions.has(PermissionFlagsBits.ManageGuild)) {
+      return interaction.editReply({ content: 'このコマンドを実行するには「サーバーの管理」権限が必要です。' });
     }
 
     const channel = interaction.options.getChannel('channel', true);
     const role = interaction.options.getRole('role', false);
+
+    if (!interaction.guild) {
+      return interaction.editReply({ content: 'サーバー内で実行してください。' });
+    }
 
     try {
       let result;
@@ -48,14 +46,14 @@ module.exports = {
         });
       }
 
-      if (result.deletedCount > 0) {
-        await interaction.editReply({ content: `✅ ${result.deletedCount}件の通知登録を解除しました。` });
+      if (result.deletedCount && result.deletedCount > 0) {
+        await interaction.editReply({ content: `✅ 登録を解除しました（${result.deletedCount}件）。` });
       } else {
-        await interaction.editReply({ content: 'このチャンネルには新コミュ通知の登録はありませんでした。' });
+        await interaction.editReply({ content: '登録が見つかりませんでした。' });
       }
-    } catch (e) {
-      console.error('MongoDB 操作エラー:', e);
-      await interaction.editReply({ content: '解除中にエラーが発生しました。', ephemeral: true });
+    } catch (err) {
+      console.error('MongoDBからのデータ削除中にエラー:', err);
+      await interaction.editReply({ content: 'データベースエラーが発生しました。' });
     }
-  },
+  }
 };

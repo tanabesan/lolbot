@@ -5,7 +5,6 @@ const express = require('express');
 const { Client, Collection, GatewayIntentBits, EmbedBuilder } = require('discord.js');
 const axios = require('axios');
 const mongoose = require('mongoose');
-const Database = require('better-sqlite3'); // SQLiteの移行用
 
 // Discordトークンが設定されていない場合は終了
 if (!process.env.DISCORD_TOKEN) {
@@ -61,58 +60,6 @@ if (fs.existsSync(commandsPath)) {
     console.warn('[警告] commands ディレクトリが見つかりませんでした。スラッシュコマンドは動作しません。 / [WARNING] The commands directory was not found. Slash commands will not work.');
 }
 
-
-// ─── データ移行 / Data Migration ───
-const migrateFromOldSources = async () => {
-  try {
-    // SQLiteからのデータ移行 / Data migration from SQLite
-    if (fs.existsSync('settings.db')) {
-      console.log('SQLiteからMongoDBへデータを移行中... / Migrating data from SQLite to MongoDB...');
-      
-      const db = new Database('settings.db', { readonly: true });
-      const rows = db.prepare('SELECT * FROM subscriptions').all();
-      if (rows.length > 0) {
-        const docs = rows.map(r => ({
-          guildId: r.guild_id,
-          channelId: r.channel_id,
-          roleId: r.role_id
-        }));
-        await Subscription.insertMany(docs, { ordered: false });
-        console.log('✅ SQLiteからのデータ移行が完了しました。 / ✅ Data migration from SQLite is complete.');
-      }
-      db.close();
-    }
-  } catch (e) {
-    console.error('❌ SQLiteからのデータ移行中にエラーが発生しました:', e);
-  } finally {
-    if (fs.existsSync('settings.db')) {
-      fs.unlinkSync('settings.db');
-      console.log('✔ settings.dbを削除しました。 / ✔ settings.db has been deleted.');
-    }
-  }
-
-  try {
-    // JSONファイルからのデータ移行 / Data migration from JSON file
-    if (fs.existsSync('last_levels.json')) {
-      console.log('JSONファイルからMongoDBへデータを移行中... / Migrating data from JSON file to MongoDB...');
-      const data = fs.readFileSync('last_levels.json', 'utf-8');
-      const levelIds = JSON.parse(data);
-      if (levelIds.length > 0) {
-        const docs = levelIds.map(id => ({ levelId: id.toString() }));
-        await LastLevel.insertMany(docs, { ordered: false });
-        console.log('✅ JSONファイルからのデータ移行が完了しました。 / ✅ Data migration from JSON file is complete.');
-      }
-    }
-  } catch (e) {
-    console.error('❌ JSONファイルからのデータ移行中にエラーが発生しました:', e);
-  } finally {
-    if (fs.existsSync('last_levels.json')) {
-      fs.unlinkSync('last_levels.json');
-      console.log('✔ last_levels.jsonを削除しました。 / ✔ last_levels.json has been deleted.');
-    }
-  }
-};
-
 // ─── 新しいレベル検知・通知ロジック / New Level Detection and Notification Logic ───
 // コースの種類と対応するカスタム絵文字のIDを定義
 const CUSTOM_EMOJIS = {
@@ -123,7 +70,6 @@ const CUSTOM_EMOJIS = {
   2: { name: 'competitive',id: '1437504797547696188' }, // Competitive Race用カスタム絵文字ID
   3: { name: 'elimination',id: '1437504795899330560' }  // Elimination用カスタム絵文字ID
 };
-
 // コースの種類と対応する絵文字（文字列）を定義
 const LEVEL_TYPES = {
   // `<:name:id>` 形式でカスタム絵文字の文字列を作成
@@ -132,7 +78,6 @@ const LEVEL_TYPES = {
   2: `<:${CUSTOM_EMOJIS[2].name}:${CUSTOM_EMOJIS[2].id}> 対戦レース (Competitive Race)`,
   3: `<:${CUSTOM_EMOJIS[3].name}:${CUSTOM_EMOJIS[3].id}> エリミネーション (Elimination)`
 };
-
 const checkNewLevels = async () => {
   console.log("新しいレベルをチェック中... / Checking for new levels...");
   try {
@@ -149,11 +94,9 @@ const checkNewLevels = async () => {
 
     // 新しいレベルを見つける
     const newLevels = currentLevels.filter(level => !lastLevelIdSet.has(level.levelId.toString()));
-
     if (newLevels.length > 0) {
       console.log(`✅ ${newLevels.length} 件の新しいレベルが見つかりました! / ${newLevels.length} new levels found!`);
       await notifyNewLevels(newLevels);
-
       // 新しいレベルのIDをDBに保存するために、DBをクリアし、現在の全レベルを保存する
       await LastLevel.deleteMany({});
       const docs = Array.from(currentLevelIds).map(id => ({ levelId: id }));
@@ -179,7 +122,8 @@ const notifyNewLevels = async (newLevels) => {
       });
       for (const level of sorted) {
         // コースの種類を決定 (不明な場合はデフォルト値)
-        const courseType = LEVEL_TYPES[level.type] || '❓ 不明 (Unknown)';
+        const courseType = LEVEL_TYPES[level.type] ||
+          '❓ 不明 (Unknown)';
 
         const embed = new EmbedBuilder()
           .setTitle("新しいコースが追加されました！ 🌟")
@@ -189,11 +133,11 @@ const notifyNewLevels = async (newLevels) => {
           .addFields(
             // 🚨 コース種類フィールドをここに追加
             { name: "🏷️ コース種類", value: `**${courseType}**`, inline: true },
+      
             { name: "✏️ 作者", value: `\`${level.author || '不明'}\``, inline: true },
             // ------------------------------------
             { name: "📄 説明", value: level.description || 'なし', inline: false }
           );
-        
         await channel.send({ content: `${roleMention} 新規コースのお知らせです！`, embeds: [embed] });
       }
     } catch (error) {
@@ -207,9 +151,6 @@ const notifyNewLevels = async (newLevels) => {
 client.once('ready', async () => {
   console.log(`✅ Botが ${client.user.tag} としてログインしました! / Bot logged in as ${client.user.tag}!`);
 
-  // 起動時にデータ移行を実行
-  await migrateFromOldSources();
-
   // 起動時に最初のチェックを実行し、その後インターバルを設定
   await checkNewLevels();
   setInterval(checkNewLevels, CHECK_INTERVAL);
@@ -217,7 +158,6 @@ client.once('ready', async () => {
   // コマンドの登録をリマインド
   console.log('⚠️ スラッシュコマンドを使用するには、別途 deploy-commands.js を実行する必要があります。 / ⚠️ You need to run deploy-commands.js separately to use slash commands.');
 });
-
 client.on('interactionCreate', async interaction => {
   if (!interaction.isCommand()) return;
 
@@ -237,6 +177,7 @@ client.on('interactionCreate', async interaction => {
     const errorMessage = 'コマンド実行中にエラーが発生しました！ / There was an error while executing this command!';
     
     if (isDeferredOrReplied) {
+    
       await interaction.editReply({ content: errorMessage, ephemeral: true }).catch(() => {});
     } else {
       await interaction.reply({ content: errorMessage, ephemeral: true }).catch(() => {});

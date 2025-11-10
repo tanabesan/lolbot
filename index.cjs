@@ -78,14 +78,16 @@ const LEVEL_TYPES = {
   2: `<:${CUSTOM_EMOJIS[2].name}:${CUSTOM_EMOJIS[2].id}> 対戦レース (Competitive Race)`,
   3: `<:${CUSTOM_EMOJIS[3].name}:${CUSTOM_EMOJIS[3].id}> エリミネーション (Elimination)`
 };
+
 const checkNewLevels = async () => {
+  // 🚨 修正点 2: チェック中にステータスを変更
+  client.user.setActivity({ name: "レベルを検知中... 📡", type: 3 }); 
+  
   console.log("新しいレベルをチェック中... / Checking for new levels...");
   try {
     const response = await axios.get(API_URL, { timeout: 10000 });
-    // 🚨 修正点 1: APIレスポンスから 'l' キーでレベルリストを取得
     const currentLevels = response.data.l;
 
-    // 🚨 修正点 2: 配列でない場合に警告とデバッグログを出力
     if (!Array.isArray(currentLevels)) {
       console.error('APIから予期しないデータを受信:', JSON.stringify(response.data, null, 2));
       console.warn('APIから予期しないデータを受信しました。 / Received unexpected data from API.');
@@ -98,16 +100,28 @@ const checkNewLevels = async () => {
 
     // 新しいレベルを見つける
     const newLevels = currentLevels.filter(level => !lastLevelIdSet.has(level.levelId.toString()));
+    
     if (newLevels.length > 0) {
-      console.log(`✅ ${newLevels.length} 件の新しいレベルが見つかりました! / ${newLevels.length} new levels found!`);
+      // 🚨 修正点 3-A: 検知あり時のログメッセージ
+      console.log(`✅ ${newLevels.length} 個のコミュを検知！ / ${newLevels.length} new levels found!`); 
       await notifyNewLevels(newLevels);
       // 新しいレベルのIDをDBに保存するために、DBをクリアし、現在の全レベルを保存する
       await LastLevel.deleteMany({});
       const docs = Array.from(currentLevelIds).map(id => ({ levelId: id }));
       await LastLevel.insertMany(docs, { ordered: false });
+    } else {
+      // 🚨 修正点 3-B: 検知なし時のログメッセージ
+      console.log('✔ コミュニティレベルは検知されませんでした。 / No new community levels were detected.');
     }
   } catch (error) {
     console.error('❌ 新規レベルチェック中にエラーが発生しました:', error && error.message ? error.message : error);
+  } finally {
+    // 🚨 修正点 4: 処理完了後、元のサーバー監視ステータスに戻す
+    const serverCount = client.guilds.cache.size;
+    client.user.setActivity({
+      name: `${serverCount} サーバーを監視中... / watching ${serverCount} servers.`,
+      type: 3, // 3: Watching
+    });
   }
 };
 
@@ -153,9 +167,15 @@ const notifyNewLevels = async (newLevels) => {
 
 // ─── イベントハンドラ / Event Handlers ───
 client.once('ready', async () => {
+  const serverCount = client.guilds.cache.size; // 参加サーバー数を取得
+
   console.log(`✅ Botが ${client.user.tag} としてログインしました! / Bot logged in as ${client.user.tag}!`);
 
-  // 起動時にデータ移行を実行 (🚨 移行済みのため、呼び出しを削除)
+  // 🚨 修正点 1: ステータス表示を追加
+  client.user.setActivity({
+    name: `${serverCount} サーバーを監視中... / watching ${serverCount} servers.`,
+    type: 3, // 3: Watching
+  });
 
   // 起動時に最初のチェックを実行し、その後インターバルを設定
   await checkNewLevels();

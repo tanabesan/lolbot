@@ -17,6 +17,7 @@
   "dependencies": {
     "@discordjs/rest": "^2.6.0",
     "axios": "^1.11.0",
+    "better-sqlite3": "^9.4.3",
     "discord.js": "^14.22.1",
     "dotenv": "^16.6.1",
     "express": "^4.21.2",

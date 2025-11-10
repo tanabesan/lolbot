@@ -82,8 +82,12 @@ const checkNewLevels = async () => {
   console.log("新しいレベルをチェック中... / Checking for new levels...");
   try {
     const response = await axios.get(API_URL, { timeout: 10000 });
-    const currentLevels = response.data;
-    if (!currentLevels || !Array.isArray(currentLevels)) {
+    // 🚨 修正点 1: APIレスポンスから 'l' キーでレベルリストを取得
+    const currentLevels = response.data.l;
+
+    // 🚨 修正点 2: 配列でない場合に警告とデバッグログを出力
+    if (!Array.isArray(currentLevels)) {
+      console.error('APIから予期しないデータを受信:', JSON.stringify(response.data, null, 2));
       console.warn('APIから予期しないデータを受信しました。 / Received unexpected data from API.');
       return;
     }
@@ -150,6 +154,8 @@ const notifyNewLevels = async (newLevels) => {
 // ─── イベントハンドラ / Event Handlers ───
 client.once('ready', async () => {
   console.log(`✅ Botが ${client.user.tag} としてログインしました! / Bot logged in as ${client.user.tag}!`);
+
+  // 起動時にデータ移行を実行 (🚨 移行済みのため、呼び出しを削除)
 
   // 起動時に最初のチェックを実行し、その後インターバルを設定
   await checkNewLevels();

@@ -40,7 +40,6 @@ const TOKEN = process.env.DISCORD_TOKEN;
 
 // ─── コマンド読み込み / Command Loading ───
 const commandsPath = path.join(__dirname, 'commands');
-// 'commands' ディレクトリが存在することを確認
 if (fs.existsSync(commandsPath)) {
     const commandFiles = fs.readdirSync(commandsPath).filter(file => file.endsWith('.js'));
     for (const file of commandFiles) {
@@ -50,47 +49,48 @@ if (fs.existsSync(commandsPath)) {
         if ('data' in command && 'execute' in command) {
           client.commands.set(command.data.name, command);
         } else {
-          console.log(`[警告] ${filePath} に必要な "data" または "execute" プロパティがありません。 / [WARNING] The file at ${filePath} is missing the required "data" or "execute" properties.`);
+          console.log(`[警告] ${filePath} に必要な "data" または "execute" プロパティがありません。`);
         }
       } catch (error) {
           console.error(`コマンドファイルの読み込み中にエラーが発生しました ${filePath}:`, error);
       }
     }
 } else {
-    console.warn('[警告] commands ディレクトリが見つかりませんでした。スラッシュコマンドは動作しません。 / [WARNING] The commands directory was not found. Slash commands will not work.');
+    console.warn('[警告] commands ディレクトリが見つかりませんでした。');
 }
 
-// ─── 新しいレベル検知・通知ロジック / New Level Detection and Notification Logic ───
-// コースの種類と対応するカスタム絵文字のIDを定義
+// ─── 新しいレベル検知・通知ロジック ───
 const CUSTOM_EMOJIS = {
-  // 【⚠️カスタム絵文字IDをBotが使用できるIDに置き換えてください！】
-  // 以下の名前は仮です。Botがアクセスできるカスタム絵文字の名前とIDを使用してください。
-  0: { name: 'sandbox',    id: '1437504794557153430' }, // Sandbox用カスタム絵文字ID
-  1: { name: 'timed',      id: '1437504792451747901' }, // Timed Race用カスタム絵文字ID
-  2: { name: 'competitive',id: '1437504797547696188' }, // Competitive Race用カスタム絵文字ID
-  3: { name: 'elimination',id: '1437504795899330560' }  // Elimination用カスタム絵文字ID
+  0: { name: 'sandbox',    id: '1437504794557153430' },
+  1: { name: 'timed',      id: '1437504792451747901' },
+  2: { name: 'competitive',id: '1437504797547696188' },
+  3: { name: 'elimination',id: '1437504795899330560' }
 };
-// コースの種類と対応する絵文字（文字列）を定義
+
 const LEVEL_TYPES = {
-  // `<:name:id>` 形式でカスタム絵文字の文字列を作成
   0: `<:${CUSTOM_EMOJIS[0].name}:${CUSTOM_EMOJIS[0].id}> サンドボックス (Sandbox)`,
   1: `<:${CUSTOM_EMOJIS[1].name}:${CUSTOM_EMOJIS[1].id}> タイムレース (Timed Race)`,
   2: `<:${CUSTOM_EMOJIS[2].name}:${CUSTOM_EMOJIS[2].id}> 対戦レース (Competitive Race)`,
   3: `<:${CUSTOM_EMOJIS[3].name}:${CUSTOM_EMOJIS[3].id}> エリミネーション (Elimination)`
 };
 
+const LEVEL_TYPES_TEXT = {
+  0: "サンドボックス (Sandbox)",
+  1: "タイムレース (Timed Race)",
+  2: "対戦レース (Competitive Race)",
+  3: "エリミネーション (Elimination)"
+};
+
 const checkNewLevels = async () => {
-  // 🚨 修正点 2: チェック中にステータスを変更
   client.user.setActivity({ name: "レベルを検知中... 📡", type: 3 }); 
   
-  console.log("新しいレベルをチェック中... / Checking for new levels...");
+  console.log("新しいレベルをチェック中...");
   try {
     const response = await axios.get(API_URL, { timeout: 10000 });
     const currentLevels = response.data.l;
 
     if (!Array.isArray(currentLevels)) {
       console.error('APIから予期しないデータを受信:', JSON.stringify(response.data, null, 2));
-      console.warn('APIから予期しないデータを受信しました。 / Received unexpected data from API.');
       return;
     }
 
@@ -98,29 +98,30 @@ const checkNewLevels = async () => {
     const lastLevels = await LastLevel.find({});
     const lastLevelIdSet = new Set(lastLevels.map(l => l.levelId));
 
-    // 新しいレベルを見つける
     const newLevels = currentLevels.filter(level => !lastLevelIdSet.has(level.levelId.toString()));
     
     if (newLevels.length > 0) {
-      // 🚨 修正点 3-A: 検知あり時のログメッセージ
-      console.log(`✅ ${newLevels.length} 個のコミュを検知！ / ${newLevels.length} new levels found!`); 
+      console.log(`✅ ${newLevels.length} 個のコミュを検知！`); 
+      
+      // Discord通知
       await notifyNewLevels(newLevels);
-      // 新しいレベルのIDをDBに保存するために、DBをクリアし、現在の全レベルを保存する
+      
+      // 外部Webhook通知（.envを使用）
+      await notifyExternalWebhook(newLevels);
+
       await LastLevel.deleteMany({});
       const docs = Array.from(currentLevelIds).map(id => ({ levelId: id }));
       await LastLevel.insertMany(docs, { ordered: false });
     } else {
-      // 🚨 修正点 3-B: 検知なし時のログメッセージ
-      console.log('✔ コミュニティレベルは検知されませんでした。 / No new community levels were detected.');
+      console.log('✔ コミュニティレベルは検知されませんでした。');
     }
   } catch (error) {
     console.error('❌ 新規レベルチェック中にエラーが発生しました:', error && error.message ? error.message : error);
   } finally {
-    // 🚨 修正点 4: 処理完了後、元のサーバー監視ステータスに戻す
     const serverCount = client.guilds.cache.size;
     client.user.setActivity({
-      name: `${serverCount} サーバーを監視中... / watching ${serverCount} servers.`,
-      type: 3, // 3: Watching
+      name: `${serverCount} サーバーを監視中...`,
+      type: 3,
     });
   }
 };
@@ -133,77 +134,88 @@ const notifyNewLevels = async (newLevels) => {
       if (!channel) continue;
 
       const roleMention = settings.roleId ? `<@&${settings.roleId}>` : "";
-      const sorted = newLevels.slice().sort((a, b) => {
-        const ai = Number(a.levelId) || 0;
-        const bi = Number(b.levelId) || 0;
-        return ai - bi;
-      });
+      const sorted = newLevels.slice().sort((a, b) => (Number(a.levelId) || 0) - (Number(b.levelId) || 0));
+      
       for (const level of sorted) {
-        // コースの種類を決定 (不明な場合はデフォルト値)
-        const courseType = LEVEL_TYPES[level.type] ||
-          '❓ 不明 (Unknown)';
-
+        const courseType = LEVEL_TYPES[level.type] || '❓ 不明 (Unknown)';
         const embed = new EmbedBuilder()
           .setTitle("新しいコースが追加されました！ 🌟")
           .setDescription(`**${level.name || '名前なし'}**`)
           .setColor(0x00FF00)
           .setThumbnail(`https://lolbeans.io/ui/level-thumbnails/${level.levelId}.png`)
           .addFields(
-            // 🚨 コース種類フィールドをここに追加
             { name: "🏷️ コース種類", value: `**${courseType}**`, inline: true },
-      
             { name: "✏️ 作者", value: `\`${level.author || '不明'}\``, inline: true },
-            // ------------------------------------
             { name: "📄 説明", value: level.description || 'なし', inline: false }
           );
         await channel.send({ content: `${roleMention} 新規コースのお知らせです！`, embeds: [embed] });
       }
     } catch (error) {
-      // チャンネルが存在しない、権限がないなどのエラー
       console.error(`サーバーID ${settings.guildId} への通知送信中にエラー:`, error && error.message ? error.message : error);
     }
   }
 };
 
-// ─── イベントハンドラ / Event Handlers ───
-client.once('ready', async () => {
-  const serverCount = client.guilds.cache.size; // 参加サーバー数を取得
-
-  console.log(`✅ Botが ${client.user.tag} としてログインしました! / Bot logged in as ${client.user.tag}!`);
-
-  // 🚨 修正点 1: ステータス表示を追加
-  client.user.setActivity({
-    name: `${serverCount} サーバーを監視中... / watching ${serverCount} servers.`,
-    type: 3, // 3: Watching
-  });
-
-  // 起動時に最初のチェックを実行し、その後インターバルを設定
-  await checkNewLevels();
-  setInterval(checkNewLevels, CHECK_INTERVAL);
-
-  // コマンドの登録をリマインド
-  console.log('⚠️ スラッシュコマンドを使用するには、別途 deploy-commands.js を実行する必要があります。 / ⚠️ You need to run deploy-commands.js separately to use slash commands.');
-});
-client.on('interactionCreate', async interaction => {
-  if (!interaction.isCommand()) return;
-
-  const command = client.commands.get(interaction.commandName);
-  if (!command) {
-    console.error(`"${interaction.commandName}" というコマンドは見つかりませんでした。 / Command "${interaction.commandName}" not found.`);
+// ─── 外部Webhookへの通知関数 (環境変数を使用) ───
+const notifyExternalWebhook = async (newLevels) => {
+  // 環境変数からURLを取得
+  const WEBHOOK_URL = process.env.EXTERNAL_WEBHOOK_URL;
+  
+  if (!WEBHOOK_URL) {
+    console.warn("⚠️ EXTERNAL_WEBHOOK_URL が .env に設定されていないため、外部送信をスキップします。");
     return;
   }
 
+  const sorted = newLevels.slice().sort((a, b) => (Number(a.levelId) || 0) - (Number(b.levelId) || 0));
+
+  for (const level of sorted) {
+    try {
+      const now = new Date().toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' });
+      const courseTypeText = LEVEL_TYPES_TEXT[level.type] || '不明 (Unknown)';
+      const imageUrl = `https://lolbeans.io/ui/level-thumbnails/${level.levelId}.png`;
+
+      const payload = {
+        username: "ろるー@ディスコボット",
+        content: "**新規コミュニティレベルが追加されました！**\n" +
+                 "----------------------------------\n" +
+                 `📛 **コース名**: ${level.name || '名前なし'}\n` +
+                 `🏷️ **種類**: ${courseTypeText}\n` +
+                 `👤 **作者**: ${level.author || '不明'}\n` +
+                 `検知時刻: ${now}\n` +
+                 "\n" +
+                 `${imageUrl}`
+      };
+
+      await axios.post(WEBHOOK_URL, payload);
+      console.log(`✅ 外部Webhook送信成功: ${level.levelId}`);
+    } catch (error) {
+      console.error(`❌ 外部Webhook送信失敗:`, error.message);
+    }
+  }
+};
+
+// ─── イベントハンドラ ───
+client.once('ready', async () => {
+  const serverCount = client.guilds.cache.size;
+  console.log(`✅ Botが ${client.user.tag} としてログインしました!`);
+  client.user.setActivity({
+    name: `${serverCount} サーバーを監視中...`,
+    type: 3,
+  });
+  await checkNewLevels();
+  setInterval(checkNewLevels, CHECK_INTERVAL);
+});
+
+client.on('interactionCreate', async interaction => {
+  if (!interaction.isCommand()) return;
+  const command = client.commands.get(interaction.commandName);
+  if (!command) return;
   try {
     await command.execute(interaction);
   } catch (error) {
-    console.error(`コマンド実行中にエラーが発生: ${interaction.commandName}`, error);
-    // すでに deferReply や reply がされているかチェック
-    const isDeferredOrReplied = interaction.deferred || interaction.replied;
-
-    const errorMessage = 'コマンド実行中にエラーが発生しました！ / There was an error while executing this command!';
-    
-    if (isDeferredOrReplied) {
-    
+    console.error(error);
+    const errorMessage = 'エラーが発生しました！';
+    if (interaction.deferred || interaction.replied) {
       await interaction.editReply({ content: errorMessage, ephemeral: true }).catch(() => {});
     } else {
       await interaction.reply({ content: errorMessage, ephemeral: true }).catch(() => {});
@@ -211,27 +223,17 @@ client.on('interactionCreate', async interaction => {
   }
 });
 
-// ─── ヘルスチェックとシャットダウン処理 / Health Check and Shutdown ───
+// ─── サーバーとシャットダウン ───
 const app = express();
 app.get('/', (req, res) => res.json({ status: 'ok', ts: Date.now() }));
-const PORT = process.env.PORT || 3000;
-const server = app.listen(PORT, () => {
-  console.log(`Health server listening on port ${PORT}`);
-});
+const server = app.listen(process.env.PORT || 3000);
+
 const shutdown = async () => {
-  console.log('シャットダウン開始... / Starting shutdown...');
+  console.log('シャットダウン開始...');
   try {
-    if (server && server.close) {
-      server.close(() => console.log('HTTP サーバを停止しました。 / HTTP server stopped.'));
-    }
-    if (mongoose.connection.readyState === 1) {
-      await mongoose.disconnect();
-      console.log('MongoDB接続を切断しました。 / MongoDB connection disconnected.');
-    }
-    if (client) {
-      client.destroy();
-      console.log('Discord クライアントを破棄しました。 / Discord client destroyed.');
-    }
+    if (server && server.close) server.close();
+    if (mongoose.connection.readyState === 1) await mongoose.disconnect();
+    if (client) client.destroy();
   } catch (e) {
     console.warn('接続切断でエラー:', e);
   } finally {
@@ -242,19 +244,11 @@ process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
 
 (async () => {
-  if (!process.env.MONGO_URI) {
-    console.error('❌ 環境変数 MONGO_URI が設定されていません。 / ❌ The environment variable MONGO_URI is not set.');
-    process.exit(1);
-  }
-
   try {
     await mongoose.connect(process.env.MONGO_URI);
-    console.log('✅ MongoDBに接続しました。 / Connected to MongoDB.');
-    
-    // Discordにログイン
     await client.login(TOKEN);
   } catch (error) {
-    console.error('致命的なエラー: 接続またはログインに失敗しました。', error);
+    console.error(error);
     process.exit(1);
   }
 })();

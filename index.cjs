@@ -2,7 +2,7 @@ require('dotenv').config();
 const fs = require('node:fs');
 const path = require('node:path');
 const express = require('express');
-const { Client, Collection, GatewayIntentBits, EmbedBuilder } = require('discord.js');
+const { Client, Collection, GatewayIntentBits, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
 const axios = require('axios');
 const mongoose = require('mongoose');
 
@@ -15,6 +15,23 @@ if (!process.env.DISCORD_TOKEN) {
 const API_URL_NORMAL   = "https://s.lolbeans.io/level-list?i=0&t=1&n=10&m"; // 通常 New 欄
 const API_URL_HARDCORE = "https://s.lolbeans.io/level-list?i=0&t=4&n=10&m"; // Hardcore 欄
 const CHECK_INTERVAL = 10 * 60 * 1000; // 10分
+const PLAY_URL_BASE = "https://lolbeans.io/level/";
+
+// ─── levelId → shortId 変換 ───
+const Ts = 'CMWXZEPANBTHSYVFGKJDRU';
+function levelIdToShortId(e) {
+  let t = 5 * e, n = '';
+  for (; 0 < t;) {
+    var i = t % Ts.length;
+    n = Ts.charAt(i) + n;
+    t = Math.floor(t / Ts.length);
+  }
+  while (n.length < 5) n = Ts.charAt(0) + n;
+  return n;
+}
+function levelIdToPlayUrl(levelId) {
+  return `${PLAY_URL_BASE}${levelIdToShortId(Number(levelId))}`;
+}
 
 // ─── MongoDB スキーマ定義 ───
 const SubscriptionSchema = new mongoose.Schema({
@@ -206,7 +223,13 @@ const notifyNewLevels = async (newLevels, isHardcore) => {
           ? `${roleMention} 🔥 Hardcoreの新規コースのお知らせです！`
           : `${roleMention} 新規コースのお知らせです！`;
 
-        await channel.send({ content: contentText, embeds: [embed] });
+        const playButton = new ButtonBuilder()
+          .setLabel('▶ プレイ')
+          .setStyle(ButtonStyle.Link)
+          .setURL(levelIdToPlayUrl(level.levelId));
+        const row = new ActionRowBuilder().addComponents(playButton);
+
+        await channel.send({ content: contentText, embeds: [embed], components: [row] });
       }
     } catch (error) {
       console.error(`サーバーID ${settings.guildId} への通知送信中にエラー:`, error && error.message ? error.message : error);
@@ -216,9 +239,14 @@ const notifyNewLevels = async (newLevels, isHardcore) => {
 
 // ─── 外部Webhook通知 ───
 const notifyExternalWebhook = async (newLevels, isHardcore) => {
-  const WEBHOOK_URL = process.env.EXTERNAL_WEBHOOK_URL;
+  // .env の EXTERNAL_WEBHOOK_URL はカンマ区切りで複数指定可能
+  // 例: EXTERNAL_WEBHOOK_URL=https://discord.com/api/webhooks/xxx,https://discord.com/api/webhooks/yyy
+  const WEBHOOK_URLS = (process.env.EXTERNAL_WEBHOOK_URL || '')
+    .split(',')
+    .map(url => url.trim())
+    .filter(url => url.length > 0);
 
-  if (!WEBHOOK_URL) {
+  if (WEBHOOK_URLS.length === 0) {
     console.warn("⚠️ EXTERNAL_WEBHOOK_URL が .env に設定されていないため、外部送信をスキップします。");
     return;
   }
@@ -229,7 +257,7 @@ const notifyExternalWebhook = async (newLevels, isHardcore) => {
     try {
       const now = new Date().toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' });
       const courseTypeText = LEVEL_TYPES_TEXT[level.type] || '不明 (Unknown)';
-      const imageUrl = `https://lolbeans.io/ui/level-thumbnails/${level.levelId}.png`;
+      const playUrl = levelIdToPlayUrl(level.levelId);
 
       const header = isHardcore
         ? "**🔥 新規Hardcoreコミュニティレベルが追加されました！**"
@@ -242,17 +270,23 @@ const notifyExternalWebhook = async (newLevels, isHardcore) => {
         `${courseTypeText} | ${level.author || '不明'}`,
       ];
       if (level.description) lines.push(level.description);
-      lines.push(`検知時刻: ${now}`, "", imageUrl);
+      lines.push(`検知時刻: ${now}`, "", `▶ こちらのリンクからプレイできます: ${playUrl}`);
 
       const payload = {
         username: "ろるー@ディスコボット",
         content: lines.join('\n')
       };
 
-      await axios.post(WEBHOOK_URL, payload);
-      console.log(`✅ 外部Webhook送信成功: ${level.levelId}${isHardcore ? ' [Hardcore]' : ''}`);
+      for (const url of WEBHOOK_URLS) {
+        try {
+          await axios.post(url, payload);
+          console.log(`✅ 外部Webhook送信成功 (${url}): ${level.levelId}${isHardcore ? ' [Hardcore]' : ''}`);
+        } catch (error) {
+          console.error(`❌ 外部Webhook送信失敗 (${url}):`, error.message);
+        }
+      }
     } catch (error) {
-      console.error(`❌ 外部Webhook送信失敗:`, error.message);
+      console.error(`❌ 外部Webhook通知処理中にエラー:`, error.message);
     }
   }
 };

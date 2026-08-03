@@ -12,6 +12,21 @@ const SubscriptionSchema = new mongoose.Schema({
 });
 const Subscription = mongoose.model('Subscription', SubscriptionSchema);
 
+// YouTube: どのDiscordチャンネルに、どのYouTubeチャンネルの通知を送るか
+const YoutubeSubscriptionSchema = new mongoose.Schema({
+    guildId: { type: String, required: true },
+    channelId: { type: String, required: true },
+    youtubeChannelId: { type: String, required: true }   // 監視対象のYouTubeチャンネルID (UC...)
+});
+const YoutubeSubscription = mongoose.model('YoutubeSubscription', YoutubeSubscriptionSchema);
+
+// YouTube: 各YouTubeチャンネルごとに最後に検知した動画IDを保存
+const LastYoutubeVideoSchema = new mongoose.Schema({
+    youtubeChannelId: { type: String, unique: true },
+    videoId: String
+});
+const LastYoutubeVideo = mongoose.model('LastYoutubeVideo', LastYoutubeVideoSchema);
+
 // MongoDBに接続
 (async () => {
     if (!process.env.MONGO_URI) {

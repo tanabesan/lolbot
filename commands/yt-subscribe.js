@@ -1,4 +1,4 @@
-const { SlashCommandBuilder } = require('discord.js');
+const { SlashCommandBuilder, ChannelType } = require('discord.js');
 const mongoose = require('mongoose');
 
 // index.cjs 側で定義済みの YoutubeSubscription モデルをここでも取得する
@@ -12,9 +12,16 @@ module.exports = {
       option.setName('channel_id')
         .setDescription('YouTubeチャンネルID（UCから始まるID。ハンドル(@名前)は不可）')
         .setRequired(true)
+    )
+    .addChannelOption(option =>
+      option.setName('target_channel')
+        .setDescription('通知を送るDiscordチャンネル（指定しない場合はこのチャンネル）')
+        .addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)
+        .setRequired(false)
     ),
   async execute(interaction) {
     const youtubeChannelId = interaction.options.getString('channel_id').trim();
+    const targetChannel = interaction.options.getChannel('target_channel') ?? interaction.channel;
 
     if (!/^UC[a-zA-Z0-9_-]{22}$/.test(youtubeChannelId)) {
       await interaction.reply({
@@ -26,21 +33,21 @@ module.exports = {
 
     const existing = await YoutubeSubscription.findOne({
       guildId: interaction.guildId,
-      channelId: interaction.channelId,
+      channelId: targetChannel.id,
       youtubeChannelId
     });
 
     if (existing) {
-      await interaction.reply({ content: 'ℹ️ このチャンネルは既にこのDiscordチャンネルに登録されています。', ephemeral: true });
+      await interaction.reply({ content: `ℹ️ このチャンネルは既に${targetChannel}に登録されています。`, ephemeral: true });
       return;
     }
 
     await YoutubeSubscription.create({
       guildId: interaction.guildId,
-      channelId: interaction.channelId,
+      channelId: targetChannel.id,
       youtubeChannelId
     });
 
-    await interaction.reply(`✅ YouTubeチャンネル \`${youtubeChannelId}\` の新着動画をこのチャンネルに通知するよう登録しました。`);
+    await interaction.reply(`✅ YouTubeチャンネル \`${youtubeChannelId}\` の新着動画を${targetChannel}に通知するよう登録しました。`);
   }
 };

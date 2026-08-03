@@ -18,7 +18,7 @@ const CHECK_INTERVAL = 10 * 60 * 1000; // 10分
 const PLAY_URL_BASE = "https://lolbeans.io/level/";
 
 // ─── YouTube 新着検知 ───
-const YOUTUBE_RSS_BASE = "https://www.youtube.com/feeds/videos.xml?channel_id=";
+const YOUTUBE_API_KEY = process.env.YOUTUBE_API_KEY;
 // 外部Webhook専用の監視対象（Discordチャンネルへの登録とは無関係、.envで固定管理）
 const EXTERNAL_YOUTUBE_CHANNEL_IDS = (process.env.EXTERNAL_YOUTUBE_CHANNEL_IDS || '')
   .split(',')
@@ -314,32 +314,36 @@ const notifyExternalWebhook = async (newLevels, isHardcore) => {
   }
 };
 
-// ─── YouTube RSSフィードから最新動画を取得 ───
-// APIキー不要のYouTube公式RSSフィードを利用（最新15件まで返るが先頭が最新動画）
+// ─── YouTube Data API v3から最新動画を取得 ───
+// UC...のチャンネルIDをUU...のアップロード動画プレイリストIDに変換して取得
 const fetchLatestYoutubeVideo = async (youtubeChannelId) => {
-  const url = `${YOUTUBE_RSS_BASE}${youtubeChannelId}`;
-  const response = await axios.get(url, { timeout: 10000 });
-  const xml = response.data;
+  const uploadsPlaylistId = youtubeChannelId.replace(/^UC/, 'UU');
 
-  const entryMatch = xml.match(/<entry>([\s\S]*?)<\/entry>/);
-  if (!entryMatch) return null;
-  const entry = entryMatch[1];
+  const response = await axios.get('https://www.googleapis.com/youtube/v3/playlistItems', {
+    params: {
+      part: 'snippet,contentDetails',
+      playlistId: uploadsPlaylistId,
+      maxResults: 1,
+      key: YOUTUBE_API_KEY
+    },
+    timeout: 10000
+  });
 
-  const videoIdMatch = entry.match(/<yt:videoId>([^<]+)<\/yt:videoId>/);
-  const titleMatch   = entry.match(/<title>([\s\S]*?)<\/title>/);
-  const authorMatch  = xml.match(/<name>([^<]+)<\/name>/);
-  const thumbMatch   = entry.match(/<media:thumbnail url="([^"]+)"/);
-  const publishedMatch = entry.match(/<published>([^<]+)<\/published>/);
+  const items = response.data.items;
+  if (!items || items.length === 0) return null;
 
-  if (!videoIdMatch) return null;
+  const item = items[0];
+  const videoId = item.contentDetails.videoId;
+  const snippet = item.snippet;
 
-  const videoId = videoIdMatch[1];
   return {
     videoId,
-    title: titleMatch ? titleMatch[1] : '（タイトル不明）',
-    author: authorMatch ? authorMatch[1] : '不明',
-    thumbnail: thumbMatch ? thumbMatch[1] : null,
-    publishedAt: publishedMatch ? publishedMatch[1] : null,
+    title: snippet.title || '（タイトル不明）',
+    author: snippet.channelTitle || '不明',
+    thumbnail: (snippet.thumbnails && (snippet.thumbnails.high || snippet.thumbnails.default))
+      ? (snippet.thumbnails.high ? snippet.thumbnails.high.url : snippet.thumbnails.default.url)
+      : null,
+    publishedAt: snippet.publishedAt || null,
     url: `https://www.youtube.com/watch?v=${videoId}`
   };
 };

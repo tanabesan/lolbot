@@ -28,22 +28,22 @@ const whenChoices = [
 module.exports = {
   data: new SlashCommandBuilder()
     .setName('leaderboard')
-    .setDescription('リーダーボードを表示。 / Display the leaderboard.')
+    .setDescription('リーダーボードを表示します')
     .addStringOption(opt =>
       opt.setName('region')
-        .setDescription('地域を選択してください Please select your region')
+        .setDescription('地域を選択してください')
         .setRequired(true)
         .addChoices(...regionChoices)
     )
     .addStringOption(opt =>
       opt.setName('timeframe')
-        .setDescription('集計期間を選択してください Please select an aggregation period')
+        .setDescription('集計期間を選択してください')
         .setRequired(true)
         .addChoices(...timeframeChoices)
     )
     .addStringOption(opt =>
       opt.setName('when')
-        .setDescription('表示するランキングの時間 Time of ranking to be displayed')
+        .setDescription('表示するランキングの時間を選択してください')
         .setRequired(true)
         .addChoices(...whenChoices)
     ),
@@ -90,8 +90,8 @@ module.exports = {
       if (!values || !values.length) {
         const noEntryEmbed = new EmbedBuilder()
           .setColor(0xFF0000) // 赤色 / Red color
-          .setTitle('📭 エントリーが見つかりません！\nEntry not found!')
-          .setDescription(`**${regionText}** の **${whenText}** の **${timeframeText}** ランキングにエントリーがありませんでした。\n**${regionText}** of **${whenText}** **${timeframeText}** ranking had no entries.`);
+          .setTitle('📭 エントリーが見つかりません！')
+          .setDescription(`**${regionText}** の **${whenText}** の **${timeframeText}** ランキングにエントリーがありませんでした。`);
         return interaction.editReply({ embeds: [noEntryEmbed] });
       }
 
@@ -124,8 +124,8 @@ module.exports = {
       // エラーが発生した場合もユーザーにフィードバック / Provide feedback to the user even if an error occurs
       const errorEmbed = new EmbedBuilder()
         .setColor(0xFF0000)
-        .setTitle('❌ エラーが発生しました An error has occurred.')
-        .setDescription('リーダーボードの取得中に問題が発生しました。時間をおいて再度お試しください。\nA problem occurred while retrieving the leaderboard. Please try again after some time.');
+        .setTitle('❌ エラーが発生しました')
+        .setDescription('リーダーボードの取得中に問題が発生しました。時間をおいて再度お試しください。');
       if (interaction.deferred || interaction.replied) {
         await interaction.editReply({ embeds: [errorEmbed], content: '' });
       } else {

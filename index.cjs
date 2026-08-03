@@ -17,6 +17,14 @@ const API_URL_HARDCORE = "https://s.lolbeans.io/level-list?i=0&t=4&n=10&m"; // H
 const CHECK_INTERVAL = 10 * 60 * 1000; // 10分
 const PLAY_URL_BASE = "https://lolbeans.io/level/";
 
+// ─── YouTube 新着検知 ───
+const YOUTUBE_RSS_BASE = "https://www.youtube.com/feeds/videos.xml?channel_id=";
+// 外部Webhook専用の監視対象（Discordチャンネルへの登録とは無関係、.envで固定管理）
+const EXTERNAL_YOUTUBE_CHANNEL_IDS = (process.env.EXTERNAL_YOUTUBE_CHANNEL_IDS || '')
+  .split(',')
+  .map(id => id.trim())
+  .filter(id => id.length > 0);
+
 // ─── levelId → shortId 変換 ───
 const Ts = 'CMWXZEPANBTHSYVFGKJDRU';
 function levelIdToShortId(e) {
@@ -47,9 +55,23 @@ const LastHardcoreLevelSchema = new mongoose.Schema({
   levelId: { type: String, unique: true }
 });
 
+// YouTube: どのDiscordチャンネルに、どのYouTubeチャンネルの通知を送るか
+const YoutubeSubscriptionSchema = new mongoose.Schema({
+  guildId:          { type: String, required: true },
+  channelId:        { type: String, required: true }, // Discordの通知先チャンネル
+  youtubeChannelId: { type: String, required: true }   // 監視対象のYouTubeチャンネルID (UC...)
+});
+// YouTube: 各YouTubeチャンネルごとに最後に検知した動画IDを保存
+const LastYoutubeVideoSchema = new mongoose.Schema({
+  youtubeChannelId: { type: String, unique: true },
+  videoId:          { type: String }
+});
+
 const Subscription       = mongoose.model('Subscription',      SubscriptionSchema);
 const LastLevel          = mongoose.model('LastLevel',          LastLevelSchema);
 const LastHardcoreLevel  = mongoose.model('LastHardcoreLevel',  LastHardcoreLevelSchema);
+const YoutubeSubscription = mongoose.model('YoutubeSubscription', YoutubeSubscriptionSchema);
+const LastYoutubeVideo    = mongoose.model('LastYoutubeVideo',    LastYoutubeVideoSchema);
 
 // ─── Client 初期化 ───
 const client = new Client({
@@ -179,6 +201,7 @@ const checkAll = async () => {
 
   await checkNewLevels();
   await checkNewHardcoreLevels();
+  await checkNewYoutubeVideos();
 
   const serverCount = client.guilds.cache.size;
   client.user.setActivity({
@@ -287,6 +310,156 @@ const notifyExternalWebhook = async (newLevels, isHardcore) => {
       }
     } catch (error) {
       console.error(`❌ 外部Webhook通知処理中にエラー:`, error.message);
+    }
+  }
+};
+
+// ─── YouTube RSSフィードから最新動画を取得 ───
+// APIキー不要のYouTube公式RSSフィードを利用（最新15件まで返るが先頭が最新動画）
+const fetchLatestYoutubeVideo = async (youtubeChannelId) => {
+  const url = `${YOUTUBE_RSS_BASE}${youtubeChannelId}`;
+  const response = await axios.get(url, { timeout: 10000 });
+  const xml = response.data;
+
+  const entryMatch = xml.match(/<entry>([\s\S]*?)<\/entry>/);
+  if (!entryMatch) return null;
+  const entry = entryMatch[1];
+
+  const videoIdMatch = entry.match(/<yt:videoId>([^<]+)<\/yt:videoId>/);
+  const titleMatch   = entry.match(/<title>([\s\S]*?)<\/title>/);
+  const authorMatch  = xml.match(/<name>([^<]+)<\/name>/);
+  const thumbMatch   = entry.match(/<media:thumbnail url="([^"]+)"/);
+  const publishedMatch = entry.match(/<published>([^<]+)<\/published>/);
+
+  if (!videoIdMatch) return null;
+
+  const videoId = videoIdMatch[1];
+  return {
+    videoId,
+    title: titleMatch ? titleMatch[1] : '（タイトル不明）',
+    author: authorMatch ? authorMatch[1] : '不明',
+    thumbnail: thumbMatch ? thumbMatch[1] : null,
+    publishedAt: publishedMatch ? publishedMatch[1] : null,
+    url: `https://www.youtube.com/watch?v=${videoId}`
+  };
+};
+
+// ─── 登録されている全YouTubeチャンネルの新着をチェック ───
+const checkNewYoutubeVideos = async () => {
+  console.log("【YouTube】新着動画をチェック中...");
+  try {
+    const subs = await YoutubeSubscription.find({});
+
+    // Discord通知用（DB登録分）と外部Webhook専用（.env固定分）を合わせて、重複なく監視
+    const dbChannelIds = subs.map(s => s.youtubeChannelId);
+    const uniqueChannelIds = [...new Set([...dbChannelIds, ...EXTERNAL_YOUTUBE_CHANNEL_IDS])];
+
+    if (uniqueChannelIds.length === 0) {
+      console.log('✔ 【YouTube】監視対象のチャンネルはありません。');
+      return;
+    }
+
+    for (const youtubeChannelId of uniqueChannelIds) {
+      try {
+        const latest = await fetchLatestYoutubeVideo(youtubeChannelId);
+        if (!latest) continue;
+
+        const lastDoc = await LastYoutubeVideo.findOne({ youtubeChannelId });
+
+        if (!lastDoc) {
+          // 初回登録時は基準を保存するだけ（過去動画を一括通知しない）
+          await LastYoutubeVideo.create({ youtubeChannelId, videoId: latest.videoId });
+          continue;
+        }
+
+        if (lastDoc.videoId !== latest.videoId) {
+          console.log(`✅ 【YouTube】新着動画を検知: ${latest.title} (${youtubeChannelId})`);
+
+          // Discord通知: このチャンネルIDがDBに登録されている場合のみ
+          const targetSubs = subs.filter(s => s.youtubeChannelId === youtubeChannelId);
+          if (targetSubs.length > 0) {
+            await notifyNewYoutubeVideo(targetSubs, latest);
+          }
+
+          // 外部Webhook通知: .envのリストに含まれている場合のみ
+          if (EXTERNAL_YOUTUBE_CHANNEL_IDS.includes(youtubeChannelId)) {
+            await notifyExternalWebhookYoutube(latest);
+          }
+
+          lastDoc.videoId = latest.videoId;
+          await lastDoc.save();
+        }
+      } catch (innerError) {
+        console.error(`❌ 【YouTube】チャンネル ${youtubeChannelId} のチェック中にエラー:`, innerError && innerError.message ? innerError.message : innerError);
+      }
+    }
+  } catch (error) {
+    console.error('❌ 【YouTube】新着チェック処理全体でエラー:', error && error.message ? error.message : error);
+  }
+};
+
+// ─── Discordチャンネルへの新着動画通知 ───
+const notifyNewYoutubeVideo = async (targetSubs, video) => {
+  for (const sub of targetSubs) {
+    try {
+      const channel = await client.channels.fetch(sub.channelId);
+      if (!channel) continue;
+
+      const embed = new EmbedBuilder()
+        .setTitle(video.title)
+        .setURL(video.url)
+        .setDescription(`**${video.author}** が新しい動画を投稿しました！`)
+        .setColor(0xFF0000);
+
+      if (video.thumbnail) embed.setImage(video.thumbnail);
+
+      const watchButton = new ButtonBuilder()
+        .setLabel('▶ 視聴する')
+        .setStyle(ButtonStyle.Link)
+        .setURL(video.url);
+      const row = new ActionRowBuilder().addComponents(watchButton);
+
+      await channel.send({ content: `📺 新着動画のお知らせです！`, embeds: [embed], components: [row] });
+    } catch (error) {
+      console.error(`YouTube通知送信中にエラー (channelId: ${sub.channelId}):`, error && error.message ? error.message : error);
+    }
+  }
+};
+
+// ─── 外部Webhookへの新着動画通知（Discordチャンネル登録の有無とは無関係に送信） ───
+const notifyExternalWebhookYoutube = async (video) => {
+  const WEBHOOK_URLS = (process.env.EXTERNAL_WEBHOOK_URL || '')
+    .split(',')
+    .map(url => url.trim())
+    .filter(url => url.length > 0);
+
+  if (WEBHOOK_URLS.length === 0) {
+    console.warn("⚠️ EXTERNAL_WEBHOOK_URL が .env に設定されていないため、YouTube通知の外部送信をスキップします。");
+    return;
+  }
+
+  const now = new Date().toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' });
+  const lines = [
+    "**📺 新着YouTube動画のお知らせ**",
+    "----------------------------------",
+    `**${video.title}**`,
+    `投稿者: ${video.author}`,
+    `検知時刻: ${now}`,
+    "",
+    `▶ こちらから視聴できます: ${video.url}`
+  ];
+
+  const payload = {
+    username: "ろるー@ディスコボット",
+    content: lines.join('\n')
+  };
+
+  for (const url of WEBHOOK_URLS) {
+    try {
+      await axios.post(url, payload);
+      console.log(`✅ 外部Webhook送信成功 (YouTube, ${url}): ${video.videoId}`);
+    } catch (error) {
+      console.error(`❌ 外部Webhook送信失敗 (YouTube, ${url}):`, error.message);
     }
   }
 };

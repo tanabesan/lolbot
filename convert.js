@@ -1,179 +1,166 @@
 // ============================================================================
-// convert.js (CommonJSバージョン)
-// ・入力画像を強制的に指定サイズにリサイズ（NN補間）
-// ・1px＝1ブロックとして出力
-// ・id, blockId, textureId, name は引数またはデフォルト値を使用
+// convert.js — 画像 → .glol 変換（Solid Pane 敷き詰め・ラン結合による最適化版）
+// IMAGE → GLOL (template.html) のアルゴリズムをNode.jsに移植したもの
+//   1. 画像をグリッドサイズへニアレストネイバーで縮小
+//   2. 行ごとに「同色の横ラン」を検出
+//   3. 同じ列位置・幅・色の横ランが縦に続く場合は1つの大きいブロックに結合
+// 使い方:
+//   node convert.js -i in.png -o out.glol [-w 32] [-h 32] [--saturation 1] [--brightness 1]
+//                   [--keepTransparent] [-n グループ名] [-c 最大色数(省略可・減色するとブロック数が減る)]
 // ============================================================================
-
-// 'import' を 'require' に変更
 const Jimp     = require('jimp');
 const quantize = require('quantize');
 const minimist = require('minimist');
 const fs       = require('fs/promises');
 const path     = require('path');
 
-// ----------------------------------------------------------------------------
-// 定数として上限を定義
-// ----------------------------------------------------------------------------
-const MAX_COLORS = 50;
-const MAX_SIZE   = 256;
+const BLOCK_ID = 500;
+const BLOCK_NAME = 'Solid Pane';
+const SPACING = 1.0;
+const DEFAULT_QUATERNION = { x: 0, y: -0.7071067811865475, z: 0, w: 0.7071067811865476 };
+const MAX_SIZE = 256;
 
-// ----------------------------------------------------------------------------
-// CLI 引数定義
-// ----------------------------------------------------------------------------
-const argv = minimist(process.argv.slice(2), {
-  string : ['input', 'output', 'baseName'],
-  integer: [
-    'maxColors', 'startId', 'blockId', 'textureId',
-    'width', 'height'
-  ],
-  alias: {
-    i: 'input',     o: 'output',
-    c: 'maxColors',
-    s: 'startId',   b: 'blockId',
-    x: 'textureId', n: 'baseName',
-    w: 'width',     h: 'height'
-  },
-  default: {
-    startId:   1000,
-    blockId:   346,
-    textureId: 100,
-    baseName:  'art Cube',
-  }
-});
-
-if (!argv.input || !argv.output) {
-  console.error('Usage: node convert.js --input <in.png> --output <out.glol> [--width W] [--height H] [--maxColors N]');
-  process.exit(1);
+const clamp255 = v => Math.max(0, Math.min(255, Math.round(v)));
+function adjustColor(r, g, b, saturation, brightness) {
+  const gray = 0.299 * r + 0.587 * g + 0.114 * b;
+  r = gray + (r - gray) * saturation;
+  g = gray + (g - gray) * saturation;
+  b = gray + (b - gray) * saturation;
+  return [clamp255(r * brightness), clamp255(g * brightness), clamp255(b * brightness)];
 }
 
-// ----------------------------------------------------------------------------
-// 画像→.glol 変換メイン
-// ----------------------------------------------------------------------------
-async function convertImageToGlol(inputPath, outputPath, opts) {
-  // 入力ファイル存在チェック
-  try {
-    await fs.access(inputPath);
-  } catch {
-    console.error(`❌ 入力ファイルが見つかりません: ${inputPath}`);
-    process.exit(1);
+/**
+ * @param {string|Buffer} input 画像のパスまたはBuffer
+ * @param {object} opts { width, height, groupName, saturation, brightness, keepTransparent, maxColors }
+ * @returns {Promise<{glol: object, width: number, height: number, blockCount: number}>}
+ */
+async function convertImageToGlol(input, opts = {}) {
+  const image = await Jimp.read(input);
+  const srcW = image.bitmap.width, srcH = image.bitmap.height;
+  const aspect = srcW / srcH;
+
+  // 幅・高さ: 片方だけなら縦横比を維持、両方なければ幅32
+  let gw = opts.width, gh = opts.height;
+  if (!gw && !gh) gw = 32;
+  if (gw && !gh) gh = Math.max(1, Math.round(gw / aspect));
+  if (gh && !gw) gw = Math.max(1, Math.round(gh * aspect));
+  gw = Math.min(MAX_SIZE, Math.max(1, Math.floor(gw)));
+  gh = Math.min(MAX_SIZE, Math.max(1, Math.floor(gh)));
+
+  const groupName = opts.groupName || 'Converted';
+  const saturation = opts.saturation ?? 1;
+  const brightness = opts.brightness ?? 1;
+  const keepTransparent = !!opts.keepTransparent;
+
+  image.resize(gw, gh, Jimp.RESIZE_NEAREST_NEIGHBOR);
+  const data = image.bitmap.data;
+
+  // 色の前処理（彩度・明度）。任意で減色してラン結合しやすくする
+  const rgb = new Array(gw * gh);
+  const solid = [];
+  for (let i = 0; i < gw * gh; i++) {
+    const a = data[i * 4 + 3];
+    if (!keepTransparent && a < 10) { rgb[i] = null; continue; }
+    rgb[i] = adjustColor(data[i * 4], data[i * 4 + 1], data[i * 4 + 2], saturation, brightness);
+    solid.push(rgb[i]);
   }
-
-  // 1) 画像読み込み
-  const image = await Jimp.read(inputPath);
-
-  // 2) 強制リサイズ：引数で指定されたサイズ（Nearest Neighbor）
-  image.resize(opts.width, opts.height, Jimp.RESIZE_NEAREST_NEIGHBOR);
-
-  console.log(`Resized → ${opts.width}×${opts.height}`);
-
-  // 3) 全ピクセル色収集（透明は無視）
-  const pixels = [];
-  image.scan(0, 0, opts.width, opts.height, function(x, y, idx) {
-    const alpha = this.bitmap.data[idx + 3];
-    if (alpha === 0) return;
-    pixels.push([
-      this.bitmap.data[idx + 0],
-      this.bitmap.data[idx + 1],
-      this.bitmap.data[idx + 2]
-    ]);
-  });
-
-  // 4) パレット量子化（出力上は色番のみ利用）
-  const cmap    = quantize(pixels, opts.maxColors);
-  const palette = cmap.palette();
-
-  // 5) ブロック & グループ生成
-  const blocks   = [];
-  const groupDot = [];
-  let idCounter  = opts.startId;
-
-  image.scan(0, 0, opts.width, opts.height, function(x, y, idx) {
-    const alpha = this.bitmap.data[idx + 3];
-    if (alpha === 0) return;
-
-    // 最近傍パレット色インデックス
-    const r = this.bitmap.data[idx + 0];
-    const g = this.bitmap.data[idx + 1];
-    const b = this.bitmap.data[idx + 2];
-    let bestIdx = 0, bestDist = Infinity;
-    palette.forEach((prgb, i) => {
-      const d = (r - prgb[0])**2
-              + (g - prgb[1])**2
-              + (b - prgb[2])**2;
-      if (d < bestDist) {
-        bestDist = d;
-        bestIdx  = i;
-      }
-    });
-
-    blocks.push({
-      id:        idCounter,
-      blockId:   opts.blockId,
-      name:      opts.baseName,
-      textureId: opts.textureId,
-      tintColor: ((palette[bestIdx][0] << 16)
-                | (palette[bestIdx][1] << 8)
-                |  palette[bestIdx][2]),
-      position: {
-        x: (opts.height - 1 - x) * 0.1,
-        y: (opts.height - 1 - y) * 0.1,
-        z: 0
-      },
-      scale: {
-        x: 0.01,
-        y: 0.01,
-        z: 0.01
-      }
-    });
-
-    groupDot.push(idCounter);
-    idCounter++;
-  });
-
-  // 6) .glol 組み立て
-  const glol = {
-    version: 1,
-    blocks,
-    groups: { dot: groupDot }
+  let palette = null;
+  if (opts.maxColors && opts.maxColors >= 2 && solid.length > 0) {
+    const cmap = quantize(solid, Math.min(opts.maxColors, 256));
+    if (cmap) {
+      palette = cmap;
+      for (let i = 0; i < rgb.length; i++) if (rgb[i]) rgb[i] = cmap.map(rgb[i]);
+    }
+  }
+  const tintAt = (col, row) => {
+    const c = rgb[row * gw + col];
+    return c ? (c[0] << 16) + (c[1] << 8) + c[2] : null;
   };
 
-  // 7) 書き出し
-  const absoluteOut = path.resolve(outputPath);
-  await fs.mkdir(path.dirname(absoluteOut), { recursive: true });
-  await fs.writeFile(absoluteOut, JSON.stringify(glol, null, 2), 'utf-8');
-  console.log(`✔ .glol created at: ${absoluteOut}`);
+  // 1st pass: 各行で同色の横ラン
+  const rowRuns = [];
+  for (let row = 0; row < gh; row++) {
+    const runs = [];
+    let col = 0;
+    while (col < gw) {
+      const tint = tintAt(col, row);
+      if (tint === null) { col++; continue; }
+      let len = 1;
+      while (col + len < gw && tintAt(col + len, row) === tint) len++;
+      runs.push([col, len, tint]);
+      col += len;
+    }
+    rowRuns.push(runs);
+  }
+
+  // 2nd pass: 同じ列・幅・色の横ランが縦に続けば1ブロックに結合
+  const blocks = [];
+  const ids = [];
+  let nextId = 1;
+  const open = new Map();
+  const flush = (key, info) => {
+    const [colStart, runLen, tint] = key.split(',').map(Number);
+    const { startRow, height } = info;
+    const bottomRow = startRow + height - 1;
+    const block = {
+      id: nextId,
+      blockId: BLOCK_ID,
+      name: BLOCK_NAME,
+      type: 'static',
+      position: { x: colStart * SPACING + (runLen - 1) * SPACING / 2, y: -0.5 - bottomRow * SPACING, z: 0 },
+      quaternion: { ...DEFAULT_QUATERNION },
+      tintColor: tint
+    };
+    if (runLen > 1 || height > 1) block.scale = { x: 1, y: height, z: runLen };
+    blocks.push(block);
+    ids.push(nextId++);
+  };
+  for (let row = 0; row < gh; row++) {
+    const cur = new Set(rowRuns[row].map(r => r.join(',')));
+    for (const key of Array.from(open.keys())) {
+      if (!cur.has(key)) { flush(key, open.get(key)); open.delete(key); }
+    }
+    for (const r of rowRuns[row]) {
+      const key = r.join(',');
+      if (open.has(key)) open.get(key).height++;
+      else open.set(key, { startRow: row, height: 1 });
+    }
+  }
+  for (const [key, info] of open) flush(key, info);
+
+  return {
+    glol: { blocks, groups: { [groupName]: ids }, version: 3 },
+    width: gw, height: gh, blockCount: blocks.length
+  };
 }
 
-// ----------------------------------------------------------------------------
-// 実行
-// ----------------------------------------------------------------------------
-(async () => {
-  try {
-    // ▼▼▼【修正点】上限チェックを追加 ▼▼▼
-    const opts = {
-      maxColors:  Math.min(argv.maxColors || MAX_COLORS, MAX_COLORS),
-      startId:    argv.startId,
-      blockId:    argv.blockId,
-      textureId:  argv.textureId,
-      baseName:   argv.baseName,
-      width:      Math.min(argv.width  || MAX_SIZE, MAX_SIZE),
-      height:     Math.min(argv.height || MAX_SIZE, MAX_SIZE)
-    };
+module.exports = { convertImageToGlol };
 
-    // コマンドライン引数が指定されていない場合は、上限値をデフォルトとして使用
-    if (!argv.maxColors) opts.maxColors = MAX_COLORS;
-    if (!argv.width)     opts.width     = MAX_SIZE;
-    if (!argv.height)    opts.height    = MAX_SIZE;
-    // ▲▲▲【修正点】ここまで ▲▲▲
-
-    await convertImageToGlol(
-      argv.input,
-      argv.output,
-      opts
-    );
-  } catch (e) {
+// ---- CLI ----
+if (require.main === module) {
+  const argv = minimist(process.argv.slice(2), {
+    string: ['input', 'output', 'name'],
+    boolean: ['keepTransparent'],
+    alias: { i: 'input', o: 'output', w: 'width', h: 'height', n: 'name', c: 'maxColors' }
+  });
+  if (!argv.input || !argv.output) {
+    console.error('Usage: node convert.js -i <in.png> -o <out.glol> [-w W] [-h H] [--saturation 1] [--brightness 1] [--keepTransparent] [-n name] [-c maxColors]');
+    process.exit(1);
+  }
+  (async () => {
+    try {
+      const r = await convertImageToGlol(argv.input, {
+        width: argv.width, height: argv.height, groupName: argv.name,
+        saturation: argv.saturation, brightness: argv.brightness,
+        keepTransparent: argv.keepTransparent, maxColors: argv.maxColors
+      });
+      const out = path.resolve(argv.output);
+      await fs.mkdir(path.dirname(out), { recursive: true });
+      await fs.writeFile(out, JSON.stringify(r.glol), 'utf-8');
+      console.log(`✔ ${r.width}×${r.height} → ${r.blockCount} blocks: ${out}`);
+    } catch (e) {
       console.error('❌ Conversion error:', e);
       process.exit(1);
-  }
-})();
+    }
+  })();
+}

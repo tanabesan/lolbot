@@ -59,12 +59,14 @@ const LastHardcoreLevelSchema = new mongoose.Schema({
 const YoutubeSubscriptionSchema = new mongoose.Schema({
   guildId:          { type: String, required: true },
   channelId:        { type: String, required: true }, // Discordの通知先チャンネル
-  youtubeChannelId: { type: String, required: true }   // 監視対象のYouTubeチャンネルID (UC...)
+  youtubeChannelId: { type: String, required: true },  // 監視対象のYouTubeチャンネルID (UC...)
+  title:            { type: String, default: null }     // 表示用のチャンネル名
 });
 // YouTube: 各YouTubeチャンネルごとに最後に検知した動画IDを保存
 const LastYoutubeVideoSchema = new mongoose.Schema({
   youtubeChannelId: { type: String, unique: true },
-  videoId:          { type: String }
+  videoId:          { type: String },
+  publishedAt:      { type: Date, default: null }
 });
 
 const Subscription       = mongoose.model('Subscription',      SubscriptionSchema);
@@ -127,6 +129,50 @@ const LEVEL_TYPES_TEXT = {
   3: "エリミネーション (Elimination)"
 };
 
+// ─── 新着判定の共通処理 ───
+// ・初回（DBが空）は基準を保存するだけで通知しない
+// ・保存済みの最大ID以下のコース（＝最新が削除されて繰り上がった古いコース）は通知しない
+// ・保存済みIDは削除せず蓄積する（直近300件まで）ので、削除されても再通知されない
+const processLevels = async (Model, currentLevels, label, isHardcore) => {
+  const known = await Model.find({});
+  const currentIds = currentLevels.map(l => l.levelId.toString());
+
+  if (known.length === 0) {
+    await Model.insertMany(currentIds.map(id => ({ levelId: id })), { ordered: false });
+    console.log(`✔ 【${label}】初回起動のため基準を保存しました（通知なし）。`);
+    return;
+  }
+
+  const knownSet = new Set(known.map(l => l.levelId));
+  const maxKnown = Math.max(...known.map(l => Number(l.levelId) || 0));
+  const newLevels = currentLevels.filter(l =>
+    !knownSet.has(l.levelId.toString()) && (Number(l.levelId) || 0) > maxKnown
+  );
+
+  // 通知前にDBへ記録（途中で落ちても再通知しない）
+  const toStore = currentIds.filter(id => !knownSet.has(id));
+  if (toStore.length > 0) {
+    await Model.insertMany(toStore.map(id => ({ levelId: id })), { ordered: false }).catch(e => {
+      console.warn(`【${label}】ID保存で警告:`, e.message);
+    });
+  }
+
+  if (newLevels.length > 0) {
+    console.log(`✅ 【${label}】${newLevels.length} 個のコースを検知！`);
+    await notifyNewLevels(newLevels, isHardcore);
+    await notifyExternalWebhook(newLevels, isHardcore);
+  } else {
+    console.log(`✔ 【${label}】新規コースは検知されませんでした。`);
+  }
+
+  // 古いIDの掃除（最新300件だけ残す）
+  const total = known.length + toStore.length;
+  if (total > 300) {
+    const all = (await Model.find({})).map(d => d.levelId).sort((a, b) => Number(b) - Number(a));
+    await Model.deleteMany({ levelId: { $in: all.slice(300) } });
+  }
+};
+
 // ─── 通常コース：新規検知・通知 ───
 const checkNewLevels = async () => {
   console.log("【通常】新しいレベルをチェック中...");
@@ -139,23 +185,7 @@ const checkNewLevels = async () => {
       return;
     }
 
-    const currentLevelIds = new Set(currentLevels.map(l => l.levelId.toString()));
-    const lastLevels      = await LastLevel.find({});
-    const lastLevelIdSet  = new Set(lastLevels.map(l => l.levelId));
-
-    const newLevels = currentLevels.filter(level => !lastLevelIdSet.has(level.levelId.toString()));
-
-    if (newLevels.length > 0) {
-      console.log(`✅ 【通常】${newLevels.length} 個のコースを検知！`);
-      await notifyNewLevels(newLevels, false);
-      await notifyExternalWebhook(newLevels, false);
-
-      await LastLevel.deleteMany({});
-      const docs = Array.from(currentLevelIds).map(id => ({ levelId: id }));
-      await LastLevel.insertMany(docs, { ordered: false });
-    } else {
-      console.log('✔ 【通常】新規コースは検知されませんでした。');
-    }
+    await processLevels(LastLevel, currentLevels, '通常', false);
   } catch (error) {
     console.error('❌ 【通常】レベルチェック中にエラー:', error && error.message ? error.message : error);
   }
@@ -173,23 +203,7 @@ const checkNewHardcoreLevels = async () => {
       return;
     }
 
-    const currentLevelIds  = new Set(currentLevels.map(l => l.levelId.toString()));
-    const lastLevels       = await LastHardcoreLevel.find({});
-    const lastLevelIdSet   = new Set(lastLevels.map(l => l.levelId));
-
-    const newLevels = currentLevels.filter(level => !lastLevelIdSet.has(level.levelId.toString()));
-
-    if (newLevels.length > 0) {
-      console.log(`✅ 【Hardcore】${newLevels.length} 個のコースを検知！`);
-      await notifyNewLevels(newLevels, true);
-      await notifyExternalWebhook(newLevels, true);
-
-      await LastHardcoreLevel.deleteMany({});
-      const docs = Array.from(currentLevelIds).map(id => ({ levelId: id }));
-      await LastHardcoreLevel.insertMany(docs, { ordered: false });
-    } else {
-      console.log('✔ 【Hardcore】新規コースは検知されませんでした。');
-    }
+    await processLevels(LastHardcoreLevel, currentLevels, 'Hardcore', true);
   } catch (error) {
     console.error('❌ 【Hardcore】レベルチェック中にエラー:', error && error.message ? error.message : error);
   }
@@ -202,6 +216,7 @@ const checkAll = async () => {
   await checkNewLevels();
   await checkNewHardcoreLevels();
   await checkNewYoutubeVideos();
+  await checkChangelog(); // 更新通知（10分ごとに、通知すべきものがあるか確認）
 
   const serverCount = client.guilds.cache.size;
   client.user.setActivity({
@@ -210,142 +225,144 @@ const checkAll = async () => {
   });
 };
 
-// ─── Discord通知（isHardcore フラグで見た目を切り替え）───
+// ─── 共通: 文字列を切り詰め ───
+const clip = (str, n) => (str && str.length > n) ? str.slice(0, n - 1) + '…' : (str || '');
+
+// ─── Discord通知（複数コースでも1メッセージにまとめる）───
 const notifyNewLevels = async (newLevels, isHardcore) => {
   const allSubs = await Subscription.find({});
+  const sorted = newLevels.slice().sort((a, b) => (Number(a.levelId) || 0) - (Number(b.levelId) || 0)).slice(-10); // embedは最大10個
+
+  const embeds = sorted.map(level => {
+    const courseType = LEVEL_TYPES[level.type] || '❓ 不明 (Unknown)';
+    const descLines = [
+      `**${clip(level.name || '名前なし', 100)}**`,
+      `${courseType} ｜ \`${level.author || '不明'}\``,
+    ];
+    if (level.description) descLines.push(clip(level.description, 300));
+    const embed = new EmbedBuilder()
+      .setTitle(isHardcore
+        ? "🔥 Hardcoreコースが追加されました！"
+        : "新しいコースが追加されました！ 🌟")
+      .setDescription(descLines.join('\n'))
+      .setColor(isHardcore ? 0xFF4500 : 0x00FF00)
+      .setThumbnail(`https://lolbeans.io/ui/level-thumbnails/${level.levelId}.png`);
+    if (isHardcore) embed.setFooter({ text: "💀 Hardcore" });
+    return embed;
+  });
+
+  // プレイボタン（1個なら「▶ プレイ」、複数ならコース名付き。1行5個まで）
+  const buttons = sorted.map(level => new ButtonBuilder()
+    .setLabel(sorted.length === 1 ? '▶ プレイ' : clip(`▶ ${level.name || level.levelId}`, 80))
+    .setStyle(ButtonStyle.Link)
+    .setURL(levelIdToPlayUrl(level.levelId)));
+  const rows = [];
+  for (let i = 0; i < buttons.length; i += 5) {
+    rows.push(new ActionRowBuilder().addComponents(buttons.slice(i, i + 5)));
+  }
+
   for (const settings of allSubs) {
     try {
       const channel = await client.channels.fetch(settings.channelId);
       if (!channel) continue;
 
-      const roleMention = settings.roleId ? `<@&${settings.roleId}>` : "";
-      const sorted = newLevels.slice().sort((a, b) => (Number(a.levelId) || 0) - (Number(b.levelId) || 0));
+      const roleMention = settings.roleId ? `<@&${settings.roleId}> ` : "";
+      const plural = sorted.length > 1 ? `（${sorted.length}件）` : '';
+      const contentText = isHardcore
+        ? `${roleMention}🔥 Hardcoreの新規コースのお知らせです！${plural}`
+        : `${roleMention}新規コースのお知らせです！${plural}`;
 
-      for (const level of sorted) {
-        const courseType = LEVEL_TYPES[level.type] || '❓ 不明 (Unknown)';
-
-        const descLines = [
-          `**${level.name || '名前なし'}**`,
-          `${courseType} ｜ \`${level.author || '不明'}\``,
-        ];
-        if (level.description) descLines.push(level.description);
-
-        const embed = new EmbedBuilder()
-          .setTitle(isHardcore
-            ? "🔥 Hardcoreコースが追加されました！"
-            : "新しいコースが追加されました！ 🌟")
-          .setDescription(descLines.join('\n'))
-          .setColor(isHardcore ? 0xFF4500 : 0x00FF00)
-          .setThumbnail(`https://lolbeans.io/ui/level-thumbnails/${level.levelId}.png`);
-
-        if (isHardcore) {
-          embed.setFooter({ text: "💀 Hardcore" });
-        }
-
-        const contentText = isHardcore
-          ? `${roleMention} 🔥 Hardcoreの新規コースのお知らせです！`
-          : `${roleMention} 新規コースのお知らせです！`;
-
-        const playButton = new ButtonBuilder()
-          .setLabel('▶ プレイ')
-          .setStyle(ButtonStyle.Link)
-          .setURL(levelIdToPlayUrl(level.levelId));
-        const row = new ActionRowBuilder().addComponents(playButton);
-
-        await channel.send({ content: contentText, embeds: [embed], components: [row] });
-      }
+      await channel.send({ content: contentText, embeds, components: rows });
     } catch (error) {
       console.error(`サーバーID ${settings.guildId} への通知送信中にエラー:`, error && error.message ? error.message : error);
     }
   }
 };
 
-// ─── 外部Webhook通知 ───
-const notifyExternalWebhook = async (newLevels, isHardcore) => {
-  // .env の EXTERNAL_WEBHOOK_URL はカンマ区切りで複数指定可能
-  // 例: EXTERNAL_WEBHOOK_URL=https://discord.com/api/webhooks/xxx,https://discord.com/api/webhooks/yyy
-  const WEBHOOK_URLS = (process.env.EXTERNAL_WEBHOOK_URL || '')
-    .split(',')
-    .map(url => url.trim())
-    .filter(url => url.length > 0);
+// ─── 外部Webhook送信（2000文字を超える場合のみ分割）───
+const getWebhookUrls = () => (process.env.EXTERNAL_WEBHOOK_URL || '')
+  .split(',').map(u => u.trim()).filter(u => u.length > 0);
 
-  if (WEBHOOK_URLS.length === 0) {
+const postExternalWebhook = async (blocks, tag) => {
+  const urls = getWebhookUrls();
+  if (urls.length === 0) {
     console.warn("⚠️ EXTERNAL_WEBHOOK_URL が .env に設定されていないため、外部送信をスキップします。");
     return;
   }
+  // ブロック単位で2000文字以内にまとめる
+  const chunks = [];
+  let cur = '';
+  for (const b of blocks) {
+    if (cur && (cur.length + b.length + 1) > 1900) { chunks.push(cur); cur = ''; }
+    cur += (cur ? '\n' : '') + b;
+  }
+  if (cur) chunks.push(cur);
 
-  const sorted = newLevels.slice().sort((a, b) => (Number(a.levelId) || 0) - (Number(b.levelId) || 0));
-
-  for (const level of sorted) {
-    try {
-      const now = new Date().toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' });
-      const courseTypeText = LEVEL_TYPES_TEXT[level.type] || '不明 (Unknown)';
-      const playUrl = levelIdToPlayUrl(level.levelId);
-
-      const header = isHardcore
-        ? "**🔥 新規Hardcoreコミュニティレベルが追加されました！**"
-        : "**新規コミュニティレベルが追加されました！**";
-
-      const lines = [
-        header,
-        "----------------------------------",
-        `**${level.name || '名前なし'}**`,
-        `${courseTypeText} | ${level.author || '不明'}`,
-      ];
-      if (level.description) lines.push(level.description);
-      lines.push(`検知時刻: ${now}`, "", `▶ こちらのリンクからプレイできます: ${playUrl}`);
-
-      const payload = {
-        username: "ろるー@ディスコボット",
-        content: lines.join('\n')
-      };
-
-      for (const url of WEBHOOK_URLS) {
-        try {
-          await axios.post(url, payload);
-          console.log(`✅ 外部Webhook送信成功 (${url}): ${level.levelId}${isHardcore ? ' [Hardcore]' : ''}`);
-        } catch (error) {
-          console.error(`❌ 外部Webhook送信失敗 (${url}):`, error.message);
-        }
+  for (const content of chunks) {
+    for (const url of urls) {
+      try {
+        await axios.post(url, { username: "ろるー@ディスコボット", content });
+        console.log(`✅ 外部Webhook送信成功 (${tag}, ${url})`);
+      } catch (error) {
+        console.error(`❌ 外部Webhook送信失敗 (${tag}, ${url}):`, error.message);
       }
-    } catch (error) {
-      console.error(`❌ 外部Webhook通知処理中にエラー:`, error.message);
     }
   }
 };
 
+// ─── 外部Webhook通知（コース）───
+const notifyExternalWebhook = async (newLevels, isHardcore) => {
+  const sorted = newLevels.slice().sort((a, b) => (Number(a.levelId) || 0) - (Number(b.levelId) || 0));
+  const now = new Date().toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' });
+  const plural = sorted.length > 1 ? `（${sorted.length}件）` : '';
+  const header = isHardcore
+    ? `**🔥 新規Hardcoreコミュニティレベルが追加されました！${plural}**`
+    : `**新規コミュニティレベルが追加されました！${plural}**`;
+
+  const blocks = [header, "----------------------------------", `検知時刻: ${now}`, ""];
+  for (const level of sorted) {
+    const lines = [
+      `**${level.name || '名前なし'}**`,
+      `${LEVEL_TYPES_TEXT[level.type] || '不明 (Unknown)'} | ${level.author || '不明'}`,
+    ];
+    if (level.description) lines.push(clip(level.description, 200));
+    lines.push(`▶ ${levelIdToPlayUrl(level.levelId)}`, "");
+    blocks.push(lines.join('\n'));
+  }
+  await postExternalWebhook(blocks, isHardcore ? 'Hardcore' : '通常');
+};
+
 // ─── YouTube Data API v3から最新動画を取得 ───
 // UC...のチャンネルIDをUU...のアップロード動画プレイリストIDに変換して取得
-const fetchLatestYoutubeVideo = async (youtubeChannelId) => {
+const fetchLatestYoutubeVideos = async (youtubeChannelId) => {
   const uploadsPlaylistId = youtubeChannelId.replace(/^UC/, 'UU');
 
   const response = await axios.get('https://www.googleapis.com/youtube/v3/playlistItems', {
     params: {
       part: 'snippet,contentDetails',
       playlistId: uploadsPlaylistId,
-      maxResults: 1,
+      maxResults: 10,
       key: YOUTUBE_API_KEY
     },
     timeout: 10000
   });
 
-  const items = response.data.items;
-  if (!items || items.length === 0) return null;
-
-  const item = items[0];
-  const videoId = item.contentDetails.videoId;
-  const snippet = item.snippet;
-
-  return {
-    videoId,
-    title: snippet.title || '（タイトル不明）',
-    author: snippet.channelTitle || '不明',
-    thumbnail: (snippet.thumbnails && (snippet.thumbnails.high || snippet.thumbnails.default))
-      ? (snippet.thumbnails.high ? snippet.thumbnails.high.url : snippet.thumbnails.default.url)
-      : null,
-    publishedAt: snippet.publishedAt || null,
-    url: `https://www.youtube.com/watch?v=${videoId}`
-  };
+  // 新しい順で返る
+  return (response.data.items || []).map(item => {
+    const snippet = item.snippet;
+    const videoId = item.contentDetails.videoId;
+    return {
+      videoId,
+      title: snippet.title || '（タイトル不明）',
+      author: snippet.channelTitle || '不明',
+      thumbnail: (snippet.thumbnails && (snippet.thumbnails.high || snippet.thumbnails.default))
+        ? (snippet.thumbnails.high ? snippet.thumbnails.high.url : snippet.thumbnails.default.url)
+        : null,
+      // 動画の公開日時（contentDetails.videoPublishedAt）を優先
+      publishedAt: item.contentDetails.videoPublishedAt || snippet.publishedAt || null,
+      url: `https://www.youtube.com/watch?v=${videoId}`
+    };
+  });
 };
 
 // ─── 登録されている全YouTubeチャンネルの新着をチェック ───
@@ -365,34 +382,53 @@ const checkNewYoutubeVideos = async () => {
 
     for (const youtubeChannelId of uniqueChannelIds) {
       try {
-        const latest = await fetchLatestYoutubeVideo(youtubeChannelId);
-        if (!latest) continue;
+        const videos = await fetchLatestYoutubeVideos(youtubeChannelId);
+        if (videos.length === 0) continue;
+        const latest = videos[0];
+        const latestPublished = latest.publishedAt ? new Date(latest.publishedAt) : null;
 
         const lastDoc = await LastYoutubeVideo.findOne({ youtubeChannelId });
 
         if (!lastDoc) {
           // 初回登録時は基準を保存するだけ（過去動画を一括通知しない）
-          await LastYoutubeVideo.create({ youtubeChannelId, videoId: latest.videoId });
+          await LastYoutubeVideo.create({ youtubeChannelId, videoId: latest.videoId, publishedAt: latestPublished });
           continue;
         }
 
-        if (lastDoc.videoId !== latest.videoId) {
-          console.log(`✅ 【YouTube】新着動画を検知: ${latest.title} (${youtubeChannelId})`);
+        if (lastDoc.videoId === latest.videoId) continue;
 
-          // Discord通知: このチャンネルIDがDBに登録されている場合のみ
-          const targetSubs = subs.filter(s => s.youtubeChannelId === youtubeChannelId);
-          if (targetSubs.length > 0) {
-            await notifyNewYoutubeVideo(targetSubs, latest);
-          }
-
-          // 外部Webhook通知: .envのリストに含まれている場合のみ
-          if (EXTERNAL_YOUTUBE_CHANNEL_IDS.includes(youtubeChannelId)) {
-            await notifyExternalWebhookYoutube(latest);
-          }
-
+        // 旧データ（publishedAt未保存）は基準を更新するだけ
+        if (!lastDoc.publishedAt) {
           lastDoc.videoId = latest.videoId;
+          lastDoc.publishedAt = latestPublished;
           await lastDoc.save();
+          continue;
         }
+
+        // 保存済みより新しい動画だけが対象（削除で古い動画が繰り上がった場合は対象外）
+        const newVideos = videos
+          .filter(v => v.publishedAt && new Date(v.publishedAt) > lastDoc.publishedAt)
+          .sort((a, b) => new Date(a.publishedAt) - new Date(b.publishedAt));
+
+        if (newVideos.length === 0) {
+          console.log(`ℹ️ 【YouTube】${youtubeChannelId}: 最新動画が削除された可能性があるため通知をスキップ`);
+          continue;
+        }
+
+        console.log(`✅ 【YouTube】新着動画を ${newVideos.length} 件検知 (${youtubeChannelId})`);
+
+        const targetSubs = subs.filter(s => s.youtubeChannelId === youtubeChannelId);
+        if (targetSubs.length > 0) {
+          await notifyNewYoutubeVideo(targetSubs, newVideos);
+        }
+        if (EXTERNAL_YOUTUBE_CHANNEL_IDS.includes(youtubeChannelId)) {
+          await notifyExternalWebhookYoutube(newVideos);
+        }
+
+        const newest = newVideos[newVideos.length - 1];
+        lastDoc.videoId = newest.videoId;
+        lastDoc.publishedAt = new Date(newest.publishedAt);
+        await lastDoc.save();
       } catch (innerError) {
         console.error(`❌ 【YouTube】チャンネル ${youtubeChannelId} のチェック中にエラー:`, innerError && innerError.message ? innerError.message : innerError);
       }
@@ -402,69 +438,172 @@ const checkNewYoutubeVideos = async () => {
   }
 };
 
-// ─── Discordチャンネルへの新着動画通知 ───
-const notifyNewYoutubeVideo = async (targetSubs, video) => {
+// ─── Discordチャンネルへの新着動画通知（複数でも1メッセージ）───
+const notifyNewYoutubeVideo = async (targetSubs, videos) => {
+  const list = videos.slice(-10);
+  const embeds = list.map(video => {
+    const embed = new EmbedBuilder()
+      .setTitle(clip(video.title, 256))
+      .setURL(video.url)
+      .setDescription(`**${video.author}** が新しい動画を投稿しました！`)
+      .setColor(0xFF0000);
+    if (video.thumbnail) embed.setImage(video.thumbnail);
+    return embed;
+  });
+  const buttons = list.map(video => new ButtonBuilder()
+    .setLabel(list.length === 1 ? '▶ 視聴する' : clip(`▶ ${video.title}`, 80))
+    .setStyle(ButtonStyle.Link)
+    .setURL(video.url));
+  const rows = [];
+  for (let i = 0; i < buttons.length; i += 5) {
+    rows.push(new ActionRowBuilder().addComponents(buttons.slice(i, i + 5)));
+  }
+  const content = `📺 新着動画のお知らせです！${list.length > 1 ? `（${list.length}件）` : ''}`;
+
   for (const sub of targetSubs) {
     try {
       const channel = await client.channels.fetch(sub.channelId);
       if (!channel) continue;
-
-      const embed = new EmbedBuilder()
-        .setTitle(video.title)
-        .setURL(video.url)
-        .setDescription(`**${video.author}** が新しい動画を投稿しました！`)
-        .setColor(0xFF0000);
-
-      if (video.thumbnail) embed.setImage(video.thumbnail);
-
-      const watchButton = new ButtonBuilder()
-        .setLabel('▶ 視聴する')
-        .setStyle(ButtonStyle.Link)
-        .setURL(video.url);
-      const row = new ActionRowBuilder().addComponents(watchButton);
-
-      await channel.send({ content: `📺 新着動画のお知らせです！`, embeds: [embed], components: [row] });
+      await channel.send({ content, embeds, components: rows });
     } catch (error) {
       console.error(`YouTube通知送信中にエラー (channelId: ${sub.channelId}):`, error && error.message ? error.message : error);
     }
   }
 };
 
-// ─── 外部Webhookへの新着動画通知（Discordチャンネル登録の有無とは無関係に送信） ───
-const notifyExternalWebhookYoutube = async (video) => {
-  const WEBHOOK_URLS = (process.env.EXTERNAL_WEBHOOK_URL || '')
-    .split(',')
-    .map(url => url.trim())
-    .filter(url => url.length > 0);
-
-  if (WEBHOOK_URLS.length === 0) {
-    console.warn("⚠️ EXTERNAL_WEBHOOK_URL が .env に設定されていないため、YouTube通知の外部送信をスキップします。");
-    return;
-  }
-
+// ─── 外部Webhookへの新着動画通知 ───
+const notifyExternalWebhookYoutube = async (videos) => {
   const now = new Date().toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' });
-  const lines = [
-    "**📺 新着YouTube動画のお知らせ**",
+  const blocks = [
+    `**📺 新着YouTube動画のお知らせ${videos.length > 1 ? `（${videos.length}件）` : ''}**`,
     "----------------------------------",
-    `**${video.title}**`,
-    `投稿者: ${video.author}`,
+    `投稿者: ${videos[0].author}`,
     `検知時刻: ${now}`,
-    "",
-    `▶ こちらから視聴できます: ${video.url}`
+    ""
   ];
+  for (const v of videos) {
+    blocks.push(`**${v.title}**\n▶ ${v.url}\n`);
+  }
+  await postExternalWebhook(blocks, 'YouTube');
+};
 
-  const payload = {
-    username: "ろるー@ディスコボット",
-    content: lines.join('\n')
-  };
+// ─── アップデート通知（チェンジログ）───
+// 開発者: バージョンが変わるたびに即DM
+// サーバー主: 1日に何度更新しても、最短24時間おきに未通知分をまとめて1通だけDM
+const CHANGELOG = require('./changelog.js');
+const OWNER_DIGEST_COOLDOWN = 24 * 60 * 60 * 1000;
 
-  for (const url of WEBHOOK_URLS) {
-    try {
-      await axios.post(url, payload);
-      console.log(`✅ 外部Webhook送信成功 (YouTube, ${url}): ${video.videoId}`);
-    } catch (error) {
-      console.error(`❌ 外部Webhook送信失敗 (YouTube, ${url}):`, error.message);
+const BotStateSchema = new mongoose.Schema({
+  key:                  { type: String, unique: true },
+  lastSeenVersion:      { type: String, default: '0.0.0' },  // 開発者に通知済みの最新バージョン
+  ownerNotifiedVersion: { type: String, default: '0.0.0' },  // サーバー主に通知済みの最新バージョン
+  ownerNotifiedAt:      { type: Date,   default: null }
+});
+const BotState = mongoose.model('BotState', BotStateSchema);
+
+const cmpVer = (a, b) => {
+  const pa = String(a).split('.').map(n => parseInt(n, 10) || 0);
+  const pb = String(b).split('.').map(n => parseInt(n, 10) || 0);
+  for (let i = 0; i < 3; i++) {
+    const d = (pa[i] || 0) - (pb[i] || 0);
+    if (d !== 0) return d;
+  }
+  return 0;
+};
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+const buildChangelogEmbed = (entries, footerText) => {
+  const sorted = entries.slice().sort((a, b) => cmpVer(b.version, a.version)); // 新しい順
+  const text = sorted.map(e =>
+    `**v${e.version}**（${e.date}）${e.title}\n` + e.changes.map(c => `・${c}`).join('\n')
+  ).join('\n\n');
+  return new EmbedBuilder()
+    .setColor(0x5865F2)
+    .setTitle(`🆕 アップデートのお知らせ（v${sorted[0].version}）`)
+    .setDescription(clip(text, 4000))
+    .setFooter({ text: footerText })
+    .setTimestamp();
+};
+
+const getDeveloperIds = async () => {
+  const ids = (process.env.DEVELOPER_IDS || '').split(',').map(s => s.trim()).filter(Boolean);
+  if (ids.length > 0) return ids;
+  try { // 未設定ならBotアプリの所有者（チームの場合はチーム代表）
+    const app = await client.application.fetch();
+    const o = app.owner;
+    return o ? [o.ownerId || o.id] : [];
+  } catch (e) {
+    console.warn('開発者IDの取得に失敗:', e.message);
+    return [];
+  }
+};
+
+const sendDM = async (userId, payload) => {
+  try {
+    const user = await client.users.fetch(userId);
+    await user.send(payload);
+    return true;
+  } catch (e) {
+    console.warn(`DM送信失敗 (${userId}):`, e.message);
+    return false;
+  }
+};
+
+const notifyDevelopers = async (entries) => {
+  const ids = await getDeveloperIds();
+  const embed = buildChangelogEmbed(entries, '開発者向け通知（バージョン更新時に毎回送信）');
+  const content = `🛠️ ボットを **v${entries.reduce((a, b) => cmpVer(a.version, b.version) >= 0 ? a : b).version}** に更新しました（${client.guilds.cache.size} サーバーで稼働中）`;
+  for (const id of ids) await sendDM(id, { content, embeds: [embed] });
+};
+
+const notifyGuildOwners = async (entries, excludeIds = []) => {
+  const owners = new Set(client.guilds.cache.map(g => g.ownerId));
+  excludeIds.forEach(id => owners.delete(id));
+  const embed = buildChangelogEmbed(entries, 'このお知らせはサーバーのオーナーにお送りしています（更新が続いた場合は1日1回にまとめて送信）');
+  let ok = 0;
+  for (const id of owners) {
+    if (await sendDM(id, { content: '📢 Beans Bot がアップデートされました！', embeds: [embed] })) ok++;
+    await sleep(1000); // レート制限対策
+  }
+  console.log(`📢 サーバー主へ更新通知: ${ok}/${owners.size} 件送信`);
+};
+
+let changelogBusy = false;
+const checkChangelog = async () => {
+  if (changelogBusy || CHANGELOG.length === 0) return;
+  changelogBusy = true;
+  try {
+    let state = await BotState.findOne({ key: 'main' });
+    if (!state) state = await BotState.create({ key: 'main' });
+    const latest = CHANGELOG.reduce((a, b) => cmpVer(a.version, b.version) >= 0 ? a : b);
+
+    // ① 開発者: バージョンが上がっていたら即通知（先に状態を保存して二重送信を防ぐ）
+    const devPending = CHANGELOG.filter(e => cmpVer(e.version, state.lastSeenVersion) > 0);
+    if (devPending.length > 0) {
+      state.lastSeenVersion = latest.version;
+      await state.save();
+      console.log(`🆕 バージョン更新を検知: v${latest.version}`);
+      await notifyDevelopers(devPending);
     }
+
+    // ② サーバー主: 未通知分があり、前回から24時間以上空いている（またはimportant）ときだけ、まとめて1通
+    const ownerPending = CHANGELOG.filter(e => cmpVer(e.version, state.ownerNotifiedVersion) > 0);
+    if (ownerPending.length > 0) {
+      const elapsed = state.ownerNotifiedAt ? Date.now() - state.ownerNotifiedAt.getTime() : Infinity;
+      if (elapsed >= OWNER_DIGEST_COOLDOWN || ownerPending.some(e => e.important)) {
+        state.ownerNotifiedVersion = latest.version;
+        state.ownerNotifiedAt = new Date();
+        await state.save();
+        await notifyGuildOwners(ownerPending, await getDeveloperIds());
+      } else {
+        const wait = Math.ceil((OWNER_DIGEST_COOLDOWN - elapsed) / 3600000);
+        console.log(`⏳ サーバー主への更新通知は約${wait}時間後にまとめて送信します（未通知 ${ownerPending.length} 件）`);
+      }
+    }
+  } catch (e) {
+    console.error('❌ チェンジログ通知でエラー:', e && e.message ? e.message : e);
+  } finally {
+    changelogBusy = false;
   }
 };
 
@@ -481,7 +620,12 @@ client.once('ready', async () => {
 });
 
 client.on('interactionCreate', async interaction => {
-  if (!interaction.isCommand()) return;
+  if (interaction.isAutocomplete()) {
+    const cmd = client.commands.get(interaction.commandName);
+    if (cmd && cmd.autocomplete) await cmd.autocomplete(interaction).catch(e => console.error('autocompleteエラー:', e));
+    return;
+  }
+  if (!interaction.isChatInputCommand()) return;
   const command = client.commands.get(interaction.commandName);
   if (!command) return;
   try {

@@ -131,7 +131,7 @@ const LEVEL_TYPES_TEXT = {
 
 // ─── 新着判定の共通処理 ───
 // ・初回（DBが空）は基準を保存するだけで通知しない
-// ・保存済みの最大ID以下のコース（＝最新が削除されて繰り上がった古いコース）は通知しない
+// ・一覧の先頭から既知のコースに当たるまでを新着とする（最新が削除されて繰り上がった古いコースは通知しない）
 // ・保存済みIDは削除せず蓄積する（直近300件まで）ので、削除されても再通知されない
 const processLevels = async (Model, currentLevels, label, isHardcore) => {
   const known = await Model.find({});
@@ -144,10 +144,21 @@ const processLevels = async (Model, currentLevels, label, isHardcore) => {
   }
 
   const knownSet = new Set(known.map(l => l.levelId));
-  const maxKnown = Math.max(...known.map(l => Number(l.levelId) || 0));
-  const newLevels = currentLevels.filter(l =>
-    !knownSet.has(l.levelId.toString()) && (Number(l.levelId) || 0) > maxKnown
-  );
+
+  // 一覧は新しい順。先頭から「既知のコース」に当たるまでが本当の新着。
+  // 既知のコースより後ろに現れた未知のコースは、最新コースが削除されて繰り上がった古いコースなので通知しない。
+  // （levelIdの大小では判定しない：承認順などでIDが前後するコースを見逃すため）
+  const newLevels = [];
+  const promoted = [];
+  let hitKnown = false;
+  for (const l of currentLevels) {
+    const id = l.levelId.toString();
+    if (knownSet.has(id)) { hitKnown = true; continue; }
+    (hitKnown ? promoted : newLevels).push(l);
+  }
+  if (promoted.length > 0) {
+    console.log(`ℹ️ 【${label}】繰り上がり扱いで通知をスキップ: ${promoted.map(l => l.levelId).join(', ')}`);
+  }
 
   // 通知前にDBへ記録（途中で落ちても再通知しない）
   const toStore = currentIds.filter(id => !knownSet.has(id));
@@ -332,37 +343,154 @@ const notifyExternalWebhook = async (newLevels, isHardcore) => {
   await postExternalWebhook(blocks, isHardcore ? 'Hardcore' : '通常');
 };
 
-// ─── YouTube Data API v3から最新動画を取得 ───
-// UC...のチャンネルIDをUU...のアップロード動画プレイリストIDに変換して取得
-const fetchLatestYoutubeVideos = async (youtubeChannelId) => {
-  const uploadsPlaylistId = youtubeChannelId.replace(/^UC/, 'UU');
+// ─── YouTube（通常動画・プレミア公開・ライブ配信に対応）───
+// 動画ごとに状態（none / upcoming / live）を記録し、
+//   ・新しく現れた動画（予定・配信中も含む）を通知
+//   ・「予定」だった動画が「配信中」になったら、もう一度通知
+// 種類の判定: liveStreamingDetails が無ければ通常動画、あれば duration が 0 ならライブ配信・0 でなければプレミア公開
+const YoutubeVideoStateSchema = new mongoose.Schema({
+  youtubeChannelId: { type: String, required: true },
+  videoId:          { type: String, required: true },
+  state:            { type: String, default: 'none' },   // none | upcoming | live
+  publishedAt:      { type: Date, default: null }
+});
+YoutubeVideoStateSchema.index({ youtubeChannelId: 1, videoId: 1 }, { unique: true });
+const YoutubeVideoState = mongoose.model('YoutubeVideoState', YoutubeVideoStateSchema);
 
+// アップロード一覧（新しい順）。1ユニット
+const fetchUploadsPlaylist = async (youtubeChannelId) => {
   const response = await axios.get('https://www.googleapis.com/youtube/v3/playlistItems', {
     params: {
-      part: 'snippet,contentDetails',
-      playlistId: uploadsPlaylistId,
+      part: 'contentDetails',
+      playlistId: youtubeChannelId.replace(/^UC/, 'UU'),
       maxResults: 10,
       key: YOUTUBE_API_KEY
     },
     timeout: 10000
   });
+  return (response.data.items || []).map(i => i.contentDetails.videoId);
+};
 
-  // 新しい順で返る
-  return (response.data.items || []).map(item => {
-    const snippet = item.snippet;
-    const videoId = item.contentDetails.videoId;
-    return {
-      videoId,
-      title: snippet.title || '（タイトル不明）',
-      author: snippet.channelTitle || '不明',
-      thumbnail: (snippet.thumbnails && (snippet.thumbnails.high || snippet.thumbnails.default))
-        ? (snippet.thumbnails.high ? snippet.thumbnails.high.url : snippet.thumbnails.default.url)
-        : null,
-      // 動画の公開日時（contentDetails.videoPublishedAt）を優先
-      publishedAt: item.contentDetails.videoPublishedAt || snippet.publishedAt || null,
-      url: `https://www.youtube.com/watch?v=${videoId}`
-    };
-  });
+// 動画の詳細（状態・予定時刻つき）。50件まで1ユニット
+const fetchVideoDetails = async (videoIds) => {
+  const map = new Map();
+  for (let i = 0; i < videoIds.length; i += 50) {
+    const chunk = videoIds.slice(i, i + 50);
+    const response = await axios.get('https://www.googleapis.com/youtube/v3/videos', {
+      params: { part: 'snippet,contentDetails,liveStreamingDetails,status', id: chunk.join(','), key: YOUTUBE_API_KEY },
+      timeout: 10000
+    });
+    for (const item of (response.data.items || [])) {
+      if (item.status && item.status.privacyStatus === 'private') continue; // 非公開は無いものとして扱う
+      const sn = item.snippet || {};
+      const ls = item.liveStreamingDetails || null;
+      const state = ['upcoming', 'live'].includes(sn.liveBroadcastContent) ? sn.liveBroadcastContent : 'none';
+      const isZeroDuration = /^PT?0[SD]$/.test((item.contentDetails && item.contentDetails.duration) || '');
+      let kind = 'video';
+      if (ls && state !== 'none') kind = isZeroDuration ? 'stream' : 'premiere';
+      const thumbs = sn.thumbnails || {};
+      map.set(item.id, {
+        videoId: item.id,
+        title: sn.title || '（タイトル不明）',
+        author: sn.channelTitle || '不明',
+        thumbnail: (thumbs.maxres || thumbs.high || thumbs.medium || thumbs.default || {}).url || null,
+        publishedAt: sn.publishedAt ? new Date(sn.publishedAt) : null,
+        kind, state,
+        scheduledStart: ls && ls.scheduledStartTime ? new Date(ls.scheduledStartTime) : null,
+        actualStart: ls && ls.actualStartTime ? new Date(ls.actualStartTime) : null,
+        url: `https://www.youtube.com/watch?v=${item.id}`
+      });
+    }
+  }
+  return map;
+};
+
+// 1チャンネル分のチェック。通知すべき動画（新着／配信開始）の配列を返す
+const collectYoutubeEvents = async (youtubeChannelId) => {
+  const playlistIds = await fetchUploadsPlaylist(youtubeChannelId);
+  const records = await YoutubeVideoState.find({ youtubeChannelId });
+  const recMap = new Map(records.map(r => [r.videoId, r]));
+  const baseline = records.length === 0; // 初回は基準を保存するだけ（過去動画を一括通知しない）
+
+  const trackedIds = records.filter(r => r.state !== 'none').map(r => r.videoId); // 予定・配信中の動画は状態変化を追う
+  const unknownIds = playlistIds.filter(id => !recMap.has(id));
+  const need = [...new Set([...unknownIds, ...trackedIds])];
+  if (need.length === 0) return []; // 変化しうるものが無ければAPI節約
+
+  const details = await fetchVideoDetails(need);
+  const events = [];
+
+  // ① 追跡中の動画: 予定 → 配信中 になったら通知。消えた動画は記録も削除
+  for (const r of records) {
+    if (r.state === 'none') continue;
+    const d = details.get(r.videoId);
+    if (!d) { await r.deleteOne(); continue; }
+    if (d.state !== r.state) {
+      if (r.state === 'upcoming' && d.state === 'live' && !baseline) events.push(d);
+      r.state = d.state;
+      await r.save();
+    }
+  }
+
+  // ② 未知の動画
+  const knownPubs = records.filter(r => playlistIds.includes(r.videoId) && r.publishedAt).map(r => r.publishedAt.getTime());
+  const oldestKnownPub = knownPubs.length ? Math.min(...knownPubs) : null;
+  let hitKnown = false;
+  for (const id of playlistIds) {
+    if (recMap.has(id)) { hitKnown = true; continue; }
+    const d = details.get(id);
+    if (!d) continue; // 削除・非公開
+    // 既知の動画より後ろに現れ、かつ既知のどれよりも古い → 最新動画の削除で繰り上がった過去動画
+    const promoted = hitKnown && oldestKnownPub !== null && d.publishedAt && d.publishedAt.getTime() < oldestKnownPub;
+    await YoutubeVideoState.updateOne(
+      { youtubeChannelId, videoId: id },
+      { $setOnInsert: { youtubeChannelId, videoId: id, state: d.state, publishedAt: d.publishedAt } },
+      { upsert: true }
+    );
+    if (baseline) continue;
+    if (promoted) { console.log(`ℹ️ 【YouTube】繰り上がり扱いで通知をスキップ: ${id}`); continue; }
+    events.push(d);
+  }
+
+  // 古い記録の掃除（直近100件だけ残す）
+  if (records.length + unknownIds.length > 100) {
+    const all = await YoutubeVideoState.find({ youtubeChannelId }).sort({ publishedAt: -1 });
+    const drop = all.slice(100).map(r => r._id);
+    if (drop.length) await YoutubeVideoState.deleteMany({ _id: { $in: drop } });
+  }
+
+  const key = v => (v.state === 'live' && v.actualStart ? v.actualStart : (v.scheduledStart || v.publishedAt || new Date(0))).getTime();
+  return events.sort((a, b) => key(a) - key(b));
+};
+
+// ─── 動画の種類・状態ごとの表示内容 ───
+const tsFull = d => `<t:${Math.floor(d.getTime() / 1000)}:F>`;   // 例: 2026年11月25日 20:00
+const tsRel  = d => `<t:${Math.floor(d.getTime() / 1000)}:R>`;   // 例: 3時間後（自動で更新される）
+// Discord以外のWebhook用: タイムスタンプ記法が使えないので、日本時間の文字列と「あと◯時間◯分」を送信時点で計算して入れる
+const fmtJst = d => d.toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo', year: 'numeric', month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' }) + ' (JST)';
+const fmtRemain = (d) => {
+  const min = Math.round((d.getTime() - Date.now()) / 60000);
+  if (min <= 0) return 'まもなく';
+  const day = Math.floor(min / 1440), h = Math.floor((min % 1440) / 60), m = min % 60;
+  return 'あと約' + (day ? `${day}日` : '') + (h ? `${h}時間` : '') + (!day && m ? `${m}分` : '');
+};
+const describeYoutube = (v, plain = false) => {
+  const full = d => plain ? fmtJst(d) : tsFull(d);
+  const rel  = d => plain ? fmtRemain(d) : tsRel(d);
+  const when = v.scheduledStart ? `\n⏰ ${full(v.scheduledStart)}（${rel(v.scheduledStart)}）` : '';
+  if (v.kind === 'premiere' && v.state === 'upcoming')
+    return { color: 0xFFA500, tag: '📅 プレミア公開予定', text: `**${v.author}** がプレミア公開を予定しています！${when}`, button: '▶ 待機所を開く' };
+  if (v.kind === 'premiere' && v.state === 'live')
+    return { color: 0xFF0000, tag: '🔴 プレミア公開中', text: `🔴 **${v.author}** のプレミア公開が始まりました！`, button: '▶ 視聴する' };
+  if (v.kind === 'stream' && v.state === 'upcoming')
+    return { color: 0xFFA500, tag: '📅 ライブ配信予定', text: `**${v.author}** がライブ配信を予定しています！${when}`, button: '▶ 配信ページを開く' };
+  if (v.kind === 'stream' && v.state === 'live')
+    return { color: 0xFF0000, tag: '🔴 ライブ配信中', text: `🔴 **${v.author}** がライブ配信中です！${v.actualStart ? `\n開始: ${plain ? fmtJst(v.actualStart) : tsRel(v.actualStart)}` : ''}`, button: '▶ ライブを見る' };
+  return { color: 0xFF0000, tag: '📺 新着動画', text: `**${v.author}** が新しい動画を投稿しました！`, button: '▶ 視聴する' };
+};
+const youtubeHeadline = (videos) => {
+  if (videos.length > 1) return `📺 YouTubeのお知らせです！（${videos.length}件）`;
+  return `${describeYoutube(videos[0]).tag}のお知らせです！`;
 };
 
 // ─── 登録されている全YouTubeチャンネルの新着をチェック ───
@@ -382,53 +510,14 @@ const checkNewYoutubeVideos = async () => {
 
     for (const youtubeChannelId of uniqueChannelIds) {
       try {
-        const videos = await fetchLatestYoutubeVideos(youtubeChannelId);
-        if (videos.length === 0) continue;
-        const latest = videos[0];
-        const latestPublished = latest.publishedAt ? new Date(latest.publishedAt) : null;
+        const events = await collectYoutubeEvents(youtubeChannelId);
+        if (events.length === 0) continue;
 
-        const lastDoc = await LastYoutubeVideo.findOne({ youtubeChannelId });
-
-        if (!lastDoc) {
-          // 初回登録時は基準を保存するだけ（過去動画を一括通知しない）
-          await LastYoutubeVideo.create({ youtubeChannelId, videoId: latest.videoId, publishedAt: latestPublished });
-          continue;
-        }
-
-        if (lastDoc.videoId === latest.videoId) continue;
-
-        // 旧データ（publishedAt未保存）は基準を更新するだけ
-        if (!lastDoc.publishedAt) {
-          lastDoc.videoId = latest.videoId;
-          lastDoc.publishedAt = latestPublished;
-          await lastDoc.save();
-          continue;
-        }
-
-        // 保存済みより新しい動画だけが対象（削除で古い動画が繰り上がった場合は対象外）
-        const newVideos = videos
-          .filter(v => v.publishedAt && new Date(v.publishedAt) > lastDoc.publishedAt)
-          .sort((a, b) => new Date(a.publishedAt) - new Date(b.publishedAt));
-
-        if (newVideos.length === 0) {
-          console.log(`ℹ️ 【YouTube】${youtubeChannelId}: 最新動画が削除された可能性があるため通知をスキップ`);
-          continue;
-        }
-
-        console.log(`✅ 【YouTube】新着動画を ${newVideos.length} 件検知 (${youtubeChannelId})`);
+        console.log(`✅ 【YouTube】${events.length} 件を検知 (${youtubeChannelId}): ${events.map(v => `${v.kind}/${v.state}`).join(', ')}`);
 
         const targetSubs = subs.filter(s => s.youtubeChannelId === youtubeChannelId);
-        if (targetSubs.length > 0) {
-          await notifyNewYoutubeVideo(targetSubs, newVideos);
-        }
-        if (EXTERNAL_YOUTUBE_CHANNEL_IDS.includes(youtubeChannelId)) {
-          await notifyExternalWebhookYoutube(newVideos);
-        }
-
-        const newest = newVideos[newVideos.length - 1];
-        lastDoc.videoId = newest.videoId;
-        lastDoc.publishedAt = new Date(newest.publishedAt);
-        await lastDoc.save();
+        if (targetSubs.length > 0) await notifyNewYoutubeVideo(targetSubs, events);
+        if (EXTERNAL_YOUTUBE_CHANNEL_IDS.includes(youtubeChannelId)) await notifyExternalWebhookYoutube(events);
       } catch (innerError) {
         console.error(`❌ 【YouTube】チャンネル ${youtubeChannelId} のチェック中にエラー:`, innerError && innerError.message ? innerError.message : innerError);
       }
@@ -438,27 +527,28 @@ const checkNewYoutubeVideos = async () => {
   }
 };
 
-// ─── Discordチャンネルへの新着動画通知（複数でも1メッセージ）───
+// ─── Discordチャンネルへの通知（複数でも1メッセージ）───
 const notifyNewYoutubeVideo = async (targetSubs, videos) => {
   const list = videos.slice(-10);
   const embeds = list.map(video => {
+    const info = describeYoutube(video);
     const embed = new EmbedBuilder()
       .setTitle(clip(video.title, 256))
       .setURL(video.url)
-      .setDescription(`**${video.author}** が新しい動画を投稿しました！`)
-      .setColor(0xFF0000);
+      .setDescription(info.text)
+      .setColor(info.color);
     if (video.thumbnail) embed.setImage(video.thumbnail);
     return embed;
   });
   const buttons = list.map(video => new ButtonBuilder()
-    .setLabel(list.length === 1 ? '▶ 視聴する' : clip(`▶ ${video.title}`, 80))
+    .setLabel(list.length === 1 ? describeYoutube(video).button : clip(`▶ ${video.title}`, 80))
     .setStyle(ButtonStyle.Link)
     .setURL(video.url));
   const rows = [];
   for (let i = 0; i < buttons.length; i += 5) {
     rows.push(new ActionRowBuilder().addComponents(buttons.slice(i, i + 5)));
   }
-  const content = `📺 新着動画のお知らせです！${list.length > 1 ? `（${list.length}件）` : ''}`;
+  const content = youtubeHeadline(list);
 
   for (const sub of targetSubs) {
     try {
@@ -471,18 +561,18 @@ const notifyNewYoutubeVideo = async (targetSubs, videos) => {
   }
 };
 
-// ─── 外部Webhookへの新着動画通知 ───
+// ─── 外部Webhookへの通知 ───
 const notifyExternalWebhookYoutube = async (videos) => {
   const now = new Date().toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' });
   const blocks = [
-    `**📺 新着YouTube動画のお知らせ${videos.length > 1 ? `（${videos.length}件）` : ''}**`,
+    `**${youtubeHeadline(videos)}**`,
     "----------------------------------",
-    `投稿者: ${videos[0].author}`,
     `検知時刻: ${now}`,
     ""
   ];
   for (const v of videos) {
-    blocks.push(`**${v.title}**\n▶ ${v.url}\n`);
+    const info = describeYoutube(v, true); // Webhookは日本時間のプレーンテキスト
+    blocks.push(`**${info.tag}｜${v.title}**\n${info.text}\n▶ ${v.url}\n`);
   }
   await postExternalWebhook(blocks, 'YouTube');
 };
